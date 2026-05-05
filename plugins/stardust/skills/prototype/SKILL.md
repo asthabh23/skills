@@ -67,7 +67,17 @@ is delegated to `$impeccable craft` and `$impeccable live`.
    `$stardust direct` and stop.
 4. Verify `stardust/direction.md` has an active (not pending)
    direction. Pending directions block prototype.
-5. Read `stardust/current/DESIGN.md` (the descriptive snapshot of the
+5. **Validate provenance on every page in scope.** Call
+   `validateProvenance(page)` per
+   `skills/stardust/reference/state-machine.md` § Provenance
+   validation for every page that this run will render (the
+   single `<slug>` argument when present, otherwise every
+   non-stale `directed`/`prototyped`/`approved` page). Abort with
+   the helper's error when any page lacks live-render evidence
+   — re-running `prototype` against a synthesized page record
+   silently propagates the synthesis into the rendered prototype.
+   Surface `Provenance OK on N pages` once the check passes.
+6. Read `stardust/current/DESIGN.md` (the descriptive snapshot of the
    existing site, used by the viewer's CURRENT side fallback path).
 
 ## Delegation mechanic

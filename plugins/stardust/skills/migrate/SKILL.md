@@ -64,6 +64,15 @@ sidecars.
      `approved`, `stale: false` (or `--all` /
      `--refresh-stale` / explicit `<slug>`).
    - **skipped**: everything else, with reason captured.
+7. **Validate provenance on every in-scope page.** Call
+   `validateProvenance(page)` per
+   `skills/stardust/reference/state-machine.md` § Provenance
+   validation for every page in `inScope`. Abort with the
+   helper's error when any page lacks live-render evidence —
+   migrating a synthesized page record produces deployable HTML
+   that misrepresents the source site, the exact failure mode
+   that motivated the validator. Surface `Provenance OK on N
+   pages` in the migrate-plan output before Phase 1.
 
 ## Procedure
 

@@ -19,8 +19,10 @@ The file is JSON because every consumer is non-human. It carries a
     "readArtifacts": ["https://example.com/about"],
     "synthesizedInputs": [],
     "stardustVersion": "0.2.0",
+    "renderedBy": "playwright",      // REQUIRED. "playwright" only — synthesis is forbidden (see § Live-render evidence)
+    "fetchedAt": "2026-04-25T13:41:58Z",  // ISO 8601 timestamp of the live fetch (distinct from writtenAt)
     "waitMode": "networkidle",       // configured mode: fast | medium | spec | networkidle | domcontentloaded(fallback)
-    "waitMs": 3820,                  // actual wait time, including grace and scroll pass
+    "waitMs": 3820,                  // actual wait time, including grace and scroll pass — must be > 0
     "httpStatus": 200,               // final response status after redirects
     "contentType": "text/html"       // final response content-type (without charset)
   },
@@ -99,7 +101,7 @@ full DOM tree, just enough to map IA.
   "role": "main",
   "id": null,
   "classes": [],
-  "innerText": "...",
+  "innerText": "...",                  // FULL innerText, no truncation
   "children": [
     {
       "tag": "section",
@@ -109,15 +111,44 @@ full DOM tree, just enough to map IA.
       "purpose": "hero",          // heuristic: "hero" | "feature-list" | "social-proof" | "cta-band" | "footer-nav" | "form" | "rich-text" | "unknown"
       "headlineRef": 0,            // index into headings[] if any
       "innerTextSummary": "first 240 chars",
-      "wordCount": 87
+      "wordCount": 87,
+      "body": [                    // structured paragraphs, in DOM order
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+        "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+      ],
+      "lists": [
+        { "ordered": false, "items": ["Item one", "Item two", "Item three"] }
+      ],
+      "qa": [                      // populated when an accordion is detected
+        { "q": "How do I cancel?",  "a": "From settings → billing → cancel." }
+      ],
+      "quotes": [                  // populated when testimonials / blockquotes detected
+        { "text": "Best tool we ship.", "attribution": "Jane Doe, Acme",
+          "rating": 5 }
+      ]
     }
   ]
 }
 ```
 
+`innerText` is captured in **full** — no length cap. The
+`innerTextSummary` field stays as a 240-char preview for cheap
+display in reports; consumers that need the full body read
+`innerText` directly or use the structured fields below.
+
 `purpose` is a **heuristic guess**, not ground truth. Helps `direct`
 and `prototype` reason about IA without re-parsing. When unsure, emit
 `"unknown"` — never invent.
+
+`body[]`, `lists[]`, `qa[]`, `quotes[]` are required; emit `[]` when
+the section has none of that shape (a hero card with one heading and
+one CTA legitimately has no paragraphs / lists / accordion / quotes).
+Capture rules in `playwright-recipe.md` § Capture list (7-bis). These
+fields are what migrate consumes to render real body copy under
+each section heading; without them every body region falls back to
+the placeholder-with-signature treatment (per `prototype/reference/
+before-after-shell.md` § Content sourcing hierarchy) even when the
+source page had real prose to reuse.
 
 ## § CTAs
 
@@ -378,3 +409,44 @@ The schema version is implicit in
 `_provenance.stardustVersion`. If the schema evolves, downstream
 consumers branch on the version. Backward-compatible additions do not
 require a version bump.
+
+## Live-render evidence (synthesis is forbidden)
+
+Every per-page JSON file is the result of a Playwright (or
+Playwright MCP) live render against the source URL. Synthesizing
+a page record from `_brand-extraction.json` + URL patterns +
+captured photo IDs is **forbidden**, even when the synthesized
+shape would be plausible. The 2026-04-30 lovesac.com cascade ran
+"successfully" for four phases on a 25-page inventory where 20
+pages had been synthesized this way; the failure was invisible
+until a meta-question exposed the missing live-render evidence.
+
+The forbidden shortcut is signed for in `_provenance`:
+
+| field | required value | enforced where |
+|---|---|---|
+| `renderedBy` | `"playwright"` | `extract` write-time + `validateProvenance()` at every downstream phase |
+| `waitMs` | integer `> 0` | same |
+| `fetchedAt` | ISO 8601 timestamp string | same |
+| `httpStatus` | integer (the *final* response status after redirects) | same |
+| `waitMode` | one of `fast` / `medium` / `spec` / `networkidle` / `domcontentloaded` / a `<mode>(fallback)` form | same |
+
+`extract` (and `extract --prep`) **must refuse to mark a page
+`extracted` in `state.json`** without these five fields populated
+from a real Playwright render. Sub-agents delegated to perform
+extraction must return a per-page evidence table (slug / waitMode
+/ waitMs / fetchedAt) and explicitly forbid synthesis in their
+prompt — *"must actually invoke Playwright per page"* alone is
+not sufficient; spec-level prompts must list the synthesis
+shortcut by name and forbid it.
+
+Downstream phases (`direct --prep`, `prototype`, `migrate`,
+`prepare-migration` orchestrator) call
+`validateProvenance(page)` per
+`skills/stardust/reference/state-machine.md` § Provenance
+validation **on entry, before any work**, and abort with a clear
+error if any page in scope has missing or fabricated provenance.
+The double-guard (write-time refusal at extract + read-time
+validation at every consumer) is intentional defense-in-depth:
+single-layer guards have already missed at least one synthesis
+failure mode in production.

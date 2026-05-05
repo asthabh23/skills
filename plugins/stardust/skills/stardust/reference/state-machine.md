@@ -229,6 +229,74 @@ The recommended next step uses these heuristics, in order:
 
 ---
 
+## Provenance validation
+
+Every downstream phase that reads per-page extracted JSON must
+validate its `_provenance` block before doing any work. The check
+is read-time defense-in-depth against the failure mode where
+extract (or a sub-agent delegated to it) wrote a page record by
+synthesizing from existing artifacts instead of running a live
+Playwright render. Extract's own write-time refusal
+(`current-state-schema.md` § Live-render evidence) is the
+primary guard; the read-time validator catches mid-cascade
+corruption, manual edits, partial re-runs, and recurrences of
+the synthesis bug under different rationales.
+
+### `validateProvenance(page)` — contract
+
+Given a page entry and the path to its `current/pages/<slug>.json`,
+the helper succeeds when every condition below holds and aborts
+the calling phase otherwise:
+
+| condition | rule |
+|---|---|
+| file exists | `current/pages/<slug>.json` resolves to a regular file |
+| renderedBy | `_provenance.renderedBy === "playwright"` (string equality) |
+| fetchedAt | parses as ISO 8601, not in the future, not before the project's earliest extract |
+| waitMs | integer, strictly `> 0` |
+| waitMode | matches `^(fast|medium|spec|networkidle|domcontentloaded)(\(fallback\))?$` |
+| httpStatus | integer in `[200, 399]` (4xx/5xx pages should never have landed in `state.json` as `extracted` per `extract/reference/playwright-recipe.md` § Response validation; if one did, the validator surfaces it) |
+
+When any condition fails, the calling phase aborts immediately
+with a structured error naming the slug, the failed condition,
+and the artifact path. Hint at the recovery command:
+> Page `<slug>` lacks live-render evidence (`<failed condition>`).
+> Re-extract with `$stardust extract --refresh <slug>`, or
+> investigate the synthesis source if the page record was
+> hand-edited.
+
+### When each phase calls it
+
+| phase | scope of validation |
+|---|---|
+| `direct --prep` | every page in the inventory before typing / module detection |
+| `prototype` (any mode) | every page referenced by the variant being rendered |
+| `prototype --prep` | every page-type representative slated for the archetype pass |
+| `migrate` (any mode) | every page in the migrate target list |
+| `prepare-migration` orchestrator | every claimed-extracted page at the start of Phase 1, **before** invoking `direct --prep` |
+
+Discovery-mode `extract` does **not** call the validator on its
+own outputs (it just wrote them); but extract Phase 6 must
+include a **`live: yes/no` column** in its summary report so the
+user can eyeball provenance coverage before the next phase runs.
+A column of `live: yes` across every row is the visible signal
+that the validator will pass downstream. See
+`skills/extract/SKILL.md` § Phase 6 for the report format.
+
+### Surfacing validation in reports
+
+Each consumer phase prefixes its report with a one-liner:
+> `Provenance OK on N pages.`
+
+When validation fails, the failure replaces the report:
+> `Provenance check failed on M of N pages — see error above. Phase aborted.`
+
+The visible signal makes regression cheap to catch — a
+maintainer running the cascade twice should see `Provenance OK`
+twice; a quiet absence of that line is itself a smell.
+
+---
+
 ## Concurrency
 
 Stardust does not own a long-running process. Every sub-command reads

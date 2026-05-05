@@ -46,6 +46,7 @@ values, and carries a source citation.
   "motifs": { /* see § Motifs */ },
   "componentStyle": { /* see § Component style */ },
   "systemComponents": [ /* see § System components */ ],
+  "iconFont": null,                // null | { /* see § Icon font */ }
   "voice": { /* see § Voice */ },
   "voiceTable": { /* see § Voice table */ },
   "crossPromo": { /* see § Cross-promo */ },
@@ -206,9 +207,30 @@ Aggregation rules:
     "ratios": [1.25, 1.25, 1.20],
     "matchedScale": "major-third"  // null when kind == "ad-hoc"
   },
-  "loadStrategy": "swap"            // detected from font-display in @font-face rules
+  "loadStrategy": "swap",           // detected from font-display in @font-face rules
+  "files": [                        // captured font files (per playwright-recipe.md § Capture list 16)
+    {
+      "url": "https://example.com/fonts/sohne-buch.woff2",
+      "family": "Söhne",
+      "weight": 400,
+      "style": "normal",
+      "unicodeRange": "U+0000-00FF",
+      "localPath": "stardust/current/assets/fonts/sohne-buch.woff2",
+      "sourceCssRule": "@font-face { font-family: 'Söhne'; src: url('/fonts/sohne-buch.woff2') format('woff2'); ... }",
+      "licensingFlag": "private"     // null | "private" | "open"
+    }
+  ]
 }
 ```
+
+`files[]` is required when at least one captured page references
+a `@font-face` rule. Empty array when the site uses only
+system-stack fallbacks. `licensingFlag` defaults to `null`; set
+to `"private"` when the family name does not appear in the
+known-open-licence list (Google Fonts, Adobe Fonts free tier,
+fontsource.org); `"open"` when it does. The flag is heuristic —
+a `"private"` flag means *"verify before redeploying with
+prototype output"*, not *"this font is non-free."*
 
 Identify heading vs body by which family appears in the heading
 outline (`pages/<slug>.json` § Headings) most often. If only one
@@ -435,6 +457,37 @@ component detection requires ≥ 3 pages; crawl too small").
 DOM-fingerprint diff (the thorough version) is out of scope for v0.2 —
 file an issue if the heading-sequence version misses important blocks.
 
+## § Icon font
+
+When the site uses an icon font (per `playwright-recipe.md`
+§ Capture list 17), capture the family name, the saved file, and
+the `iconClass → codepoint` table so downstream `prototype` and
+`migrate` can render the brand's actual icons rather than emoji
+fallbacks.
+
+```json
+{
+  "family": "panynj-icons",
+  "localPath": "stardust/current/assets/fonts/panynj-icons.woff2",
+  "sourceCss": "@font-face { font-family: 'panynj-icons'; src: url('/fonts/panynj-icons.woff2') format('woff2'); ... }",
+  "glyphCount": 19,                // distinct icon classes captured (subset of the font's glyph table — only the ones the site actually uses)
+  "glyphs": [
+    { "class": "icon-search",       "codepoint": "\\E928", "name": "search" },
+    { "class": "icon-accessible",   "codepoint": "\\E852", "name": "accessible" },
+    { "class": "icon-arrow-right",  "codepoint": "\\E806", "name": "arrow-right" }
+  ]
+}
+```
+
+Set `iconFont: null` when no icon font is detected (the common
+case for SVG-icon and inline-graphic sites). When detected, every
+glyph the captured pages used appears in `glyphs[]`; glyphs the
+font defines but the site doesn't deploy are out of scope.
+
+`name` is a heuristic guess from the class suffix
+(`icon-search` → `"search"`); leave `null` when the suffix is
+opaque (`icon-i7`, `glyph-22`, etc.).
+
 ## § Voice
 
 Sampled copy from the home page. Used by `direct` to reason about
@@ -445,6 +498,14 @@ DESIGN.json.
 {
   "heroHeadline": "Build, ship, and own your work",
   "heroSubcopy": "...",
+  "heroImage": {
+    "url": "https://example.com/img/hero-2-engineers-tablet.avif",
+    "alt": "Two engineers reviewing a tablet at a standing desk",
+    "source": "css-background",       // "img" | "css-background" | "css-pseudo-background" | null
+    "domPath": "main > section.hero",
+    "localPath": "stardust/current/assets/media/hero-a3f9.avif",
+    "rect": { "x": 0, "y": 80, "width": 1440, "height": 720 }
+  },
   "primaryCTALabel": "Start free trial",
   "ctaSamples": ["Start free trial", "Talk to sales", "See pricing", "Read the docs"],
   "navItems": ["Product", "Pricing", "Customers", "Docs", "Sign in"],
@@ -456,6 +517,46 @@ DESIGN.json.
   }
 }
 ```
+
+### `heroImage` resolution
+
+The hero photo is the home page's most load-bearing visual asset.
+Without this field elevated, downstream `prototype` has to re-derive
+"which captured image is the hero" from a noisy 16-image list every
+render — and frequently picks the `og:image` (a curated thumbnail
+optimised for social cards) instead of the actual visible hero. The
+2026-05-04 ups.com home shipped the wrong hero on three variants
+this way before the user noticed.
+
+Resolve from the home page's captured media (both
+`pages/home.json#media.images[]` and `media.cssBackgrounds[]` —
+the second covers `background-image` and `::before` /
+`::after` pseudo-element heroes per `playwright-recipe.md`
+§ Capture list 11):
+
+1. Filter to candidates with `rect.top < 800 px` (within the
+   first viewport).
+2. Filter to candidates with `rect.width × rect.height` ≥
+   100 000 px² (excludes header logos, tiny chips, decorative
+   columns).
+3. Filter to candidates with `rect.aspectRatio` in `[0.3, 3.0]`
+   — excludes thin banners and tall vertical strips.
+4. Pick the candidate with the **largest visible area**. Tie-
+   breaker: `<img>` over `cssBackgrounds[]` over
+   `cssBackgrounds[]` with pseudo selector (slight preference
+   for explicit DOM imagery, which downstream consumers can
+   manipulate more reliably).
+
+Set `source` to `"img"`, `"css-background"`, or
+`"css-pseudo-background"` based on which capture produced the
+winner. When no candidate survives the filters, set `heroImage:
+null` and surface in `_provenance.notes` (most non-marketing
+pages — search, 404, login — legitimately have no hero).
+
+Downstream `prototype` reads `heroImage.url` /
+`heroImage.localPath` directly when composing the hero slot
+under Mode A's image-reuse contract (per
+`skills/direct/SKILL.md` § Mode A).
 
 The `tone.guess` is a heuristic — never present it as ground truth in
 the user report. `direct` will use it as one of several signals, not

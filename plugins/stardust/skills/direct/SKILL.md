@@ -51,7 +51,18 @@ downstream sub-commands.
 4. Read `stardust/direction.md` if present. If a prior direction
    exists and `--re-direct` was not passed, ask whether the user wants
    to refine the existing direction or replace it.
-5. **Classify the captured brand signal.** Read
+5. **Validate provenance on every in-scope page** (prep mode only).
+   When `--prep` is active, call
+   `validateProvenance(page)` per
+   `skills/stardust/reference/state-machine.md` § Provenance
+   validation on every `extracted` page in `state.json` before
+   typing or module detection. Abort with the helper's error
+   when any page lacks live-render evidence. Surface
+   `Provenance OK on N pages` in the prep summary. Discovery-
+   mode `direct` does not validate (it operates on a 5-page
+   sample for which extract's own write-time refusal is
+   sufficient).
+6. **Classify the captured brand signal.** Read
    `_brand-extraction.json` and stamp one of:
    - `signal-strong` — palette has ≥ 3 distinct colors (after
      near-duplicate clustering and excluding pure black/white if they
@@ -143,7 +154,7 @@ brand-faithful) catches ambiguous phrases, and the riskier mode
 (rebrand / full divergence-seed) requires the user to name it.
 
 1. **Site migration / refresh — DEFAULT.** When the captured brand
-   signal stamped in § Setup step 5 is `signal-strong`, Mode A is
+   signal stamped in § Setup step 6 is `signal-strong`, Mode A is
    active by default. The user's phrase moves *expressive*,
    *distinctiveness*, *tone*, and *density* axes inside Mode A — but
    palette and type are pinned to the captured surface, and the
@@ -852,7 +863,7 @@ Next: $stardust prototype  (defaults to home page)
 - **(b) Insufficient brand signal for N variants.** When the
   captured brand surface has fewer than 3 distinct moves to
   amplify (e.g., monochrome palette, single type face, no
-  distinctive motifs, or `signal-thin` per § Setup step 5), refuse
+  distinctive motifs, or `signal-thin` per § Setup step 6), refuse
   to render N ≥ 3 variants under Mode A. Surface honestly:
   *"the captured surface has 2 distinct traits to amplify; producing
   3 variants would force one to invent moves not present in the

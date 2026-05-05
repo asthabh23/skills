@@ -98,6 +98,43 @@ User options:
   "exclude /search and /404 from inventory"). Re-surface summary;
   loop.
 
+#### Provenance guard (between Phase 1 and Phase 2)
+
+Before invoking `direct --prep`, validate every page in the
+inventory via `validateProvenance(page)` per
+`skills/stardust/reference/state-machine.md` § Provenance
+validation. Abort the cascade with the helper's error if any
+page lacks live-render evidence. This is the cascade-level
+defense against the failure mode where `extract --prep` (or its
+delegated sub-agent) silently synthesized one or more page
+records — extract's own write-time refusal is the primary guard,
+but the cascade adds a second check between phases so the
+synthesis bug recurring under a different rationale cannot
+quietly contaminate the rest of the run.
+
+The same guard runs implicitly inside Phase 2, 3, and 4 (each
+underlying skill's setup calls `validateProvenance()` per its
+own SKILL.md) — but surfacing it here as an explicit cascade
+step makes the abort happen *before* the user sees the Phase 2
+prep summary, which would otherwise look like a successful run.
+
+Surface in the cascade output:
+
+```
+Provenance OK on 127 pages.
+```
+
+When the check fails:
+
+```
+Provenance check failed on 20 of 127 pages — see error above.
+Cascade aborted between Phase 1 and Phase 2.
+   → Re-run extract for the affected slugs:
+       $stardust extract --refresh <slug-1>
+       $stardust extract --refresh <slug-2>
+       ...
+```
+
 ### Phase 2 — direct --prep
 
 Invoke:
