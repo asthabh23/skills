@@ -260,3 +260,52 @@ Categorize cookies by likely purpose:
   return JSON.stringify(categorized, null, 2);
 })()
 ```
+
+## Network Baseline Capture (used by Workflow 2)
+
+Workflow 2 and `testing.md` call `captureNetworkBaseline`, `isAnalyticsCall`, `isPersonalizationCall`, and `categorizeCall`. Define them here once so both consumers stay in sync.
+
+```javascript
+// Hostname + path patterns for each martech category. Keeping the patterns
+// in one place makes it obvious when a new integration needs classification.
+const CATEGORY_PATTERNS = {
+  analytics: [/\/b\/ss\//, /google-analytics\.com/, /analytics\.google\.com/, /edge\.adobedc\.net\/ee\/v1\/collect/],
+  personalization: [/tt\.omtrdc\.net/, /edge\.adobedc\.net\/ee\/v1\/interact/, /mbox/, /\/ajo\//],
+  consent: [/cookielaw\.org/, /cookiebot\.com/, /trustarc\.com/, /onetrust/],
+  social: [/facebook\.com\/tr/, /linkedin\.com\/px/, /twitter\.com\/i\/adsct/, /pinterest\.com\/ct/],
+};
+
+const matchesAny = (url, patterns) => patterns.some((p) => p.test(url));
+const isAnalyticsCall = (url) => matchesAny(url, CATEGORY_PATTERNS.analytics);
+const isPersonalizationCall = (url) => matchesAny(url, CATEGORY_PATTERNS.personalization);
+
+function categorizeCall(url) {
+  for (const [category, patterns] of Object.entries(CATEGORY_PATTERNS)) {
+    if (matchesAny(url, patterns)) return category;
+  }
+  return 'other';
+}
+
+// Drives Playwright to load the URL, captures every network request issued
+// during page load, and groups them by category. Returns both the flat list
+// and per-category buckets so callers can compare totals or inspect specifics.
+async function captureNetworkBaseline(url) {
+  const { chromium } = await ensurePlaywright();
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    const all = [];
+    page.on('request', (req) => {
+      all.push({ url: req.url(), method: req.method(), timestamp: Date.now() });
+    });
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+    const buckets = { analytics: [], personalization: [], consent: [], social: [], other: [] };
+    for (const call of all) buckets[categorizeCall(call.url)].push(call);
+    return { url, timestamp: Date.now(), all, ...buckets };
+  } finally {
+    await browser.close();
+  }
+}
+```
+
+> `ensurePlaywright` is defined in `workflows/agentic-optimization-loop.md` and handles package + browser install on first use.

@@ -178,8 +178,15 @@ function checkPersonalizationTiming(metrics) {
 
 /**
  * Check: No duplicate analytics
+ *
+ * Analytics endpoints like /collect and /b/ss/ receive many legitimate calls
+ * per page (page view + click events + form events), so keying on endpoint
+ * alone flags normal traffic as duplicates. We key on endpoint + event-type
+ * params so only true duplicates — same endpoint, same event — are reported.
+ * Param list mirrors IDENTIFYING_PARAMS in workflows/agentic-optimization-loop.md.
  */
 function checkDuplicateAnalytics(networkCalls) {
+  const IDENTIFYING_PARAMS = ['en', 't', 'pe', 'events', 'type', 'eventType', 'tid', 'rsid'];
   const analyticsCalls = networkCalls.filter(c =>
     c.url && (
       c.url.includes('/collect') ||
@@ -188,32 +195,27 @@ function checkDuplicateAnalytics(networkCalls) {
     )
   );
 
-  // Group by endpoint
-  const endpoints = {};
+  const counts = {};
   analyticsCalls.forEach(c => {
     try {
       const u = new URL(c.url);
-      const key = u.hostname + u.pathname;
-      endpoints[key] = (endpoints[key] || 0) + 1;
-    } catch {
-      // Ignore
-    }
+      const paramKey = IDENTIFYING_PARAMS.map(p => `${p}=${u.searchParams.get(p) ?? ''}`).join('&');
+      const key = `${u.hostname}${u.pathname}?${paramKey}`;
+      counts[key] = (counts[key] || 0) + 1;
+    } catch { /* ignore invalid URLs */ }
   });
 
-  const duplicates = Object.entries(endpoints)
-    .filter(([_, count]) => count > 1)
+  const duplicates = Object.entries(counts)
+    .filter(([, count]) => count > 1)
     .map(([endpoint, count]) => ({ endpoint, count }));
 
   return {
     name: 'Duplicate Analytics',
     passed: duplicates.length === 0,
-    details: {
-      totalAnalyticsCalls: analyticsCalls.length,
-      duplicates
-    },
+    details: { totalAnalyticsCalls: analyticsCalls.length, duplicates },
     recommendation: duplicates.length > 0
-      ? `Duplicate analytics calls detected. Check container cleanup: ${duplicates.map(d => d.endpoint).join(', ')}`
-      : null
+      ? `Same analytics event fired multiple times. Check container cleanup: ${duplicates.map(d => d.endpoint).join(', ')}`
+      : null,
   };
 }
 

@@ -65,44 +65,45 @@ Invoke this skill when the user asks to:
 
 This skill has three workflows. Select based on what the audit detects **and** what the user is asking for:
 
-| Detected Stack | User Intent | Workflow |
-|----------------|-------------|----------|
-| Any Adobe signal: `assets.adobedtm.com`, `_satellite`, `at.js`, `mbox`, `tt.omtrdc.net`, `alloy`, AJO — whether full stack or standalone | Step-by-step guidance, or no explicit preference | **Workflow 1: Martech Migration** |
-| Any Adobe signal (as above) | Automated, benchmark-driven, "optimize", "iterate", performance validation required | **Workflow 2: Agentic Optimization Loop** |
-| Everything else (GTM, HubSpot, OneTrust, Maps, Translate, reCAPTCHA, Cookiebot) | Any | **Workflow 3: Standard Integration** |
+| Detected Stack | Conditions | Workflow |
+|----------------|------------|----------|
+| Any Adobe signal: `assets.adobedtm.com`, `_satellite`, `at.js`, `mbox`, `tt.omtrdc.net`, `alloy`, AJO | Preview URL + repo push access available (the default for active projects) | **Workflow 2: Agentic Optimization Loop** |
+| Any Adobe signal (as above) | No preview URL yet, no push access, or user explicitly requests step-by-step walkthrough | **Workflow 1: Martech Migration** |
+| Everything else (GTM without GA4, HubSpot, OneTrust, Maps, Translate, reCAPTCHA, Cookiebot) | Any | **Workflow 3: Standard Integration** |
 
-### Workflow 1: Martech Migration (Adobe Stack — Guided)
+### Workflow 2: Agentic Optimization Loop (Adobe Stack — Default)
 
-**Use when:** Any Adobe martech signal is detected — full stack (Launch + Target + Analytics) or standalone (Launch only, Target only, alloy only) — and the user wants a clear step-by-step path or has not asked for automated optimization.
+**Use when** any Adobe martech signal is detected and the project has a live preview URL plus git push access. This is the default path for active EDS projects because it produces the same code as Workflow 1 **and** validates it against baseline performance and network regressions in the same run.
+
+**Read:** `workflows/agentic-optimization-loop.md` for the full 8-phase loop.
+
+**What the agent does autonomously:** captures performance + network baseline, analyzes the container, selects the migration strategy, applies instrumentation, deploys to preview, measures performance, detects regressions, and iterates — up to N cycles — before presenting results for human approval. The developer reviews and approves; the agent does the iteration.
+
+**Output:**
+- `scripts/scripts.js` — alloy initialization in `loadEager`
+- `scripts/delayed.js` — Launch container for remaining tags
+- `head.html` — preconnect to `edge.adobedc.net`
+- Baseline vs. post-migration network call comparison
+- Core Web Vitals delta (LCP, CLS, TBT)
+- Iteration log with strategy and outcome per cycle
+- Human escalation report if target cannot be reached
+
+### Workflow 1: Martech Migration (Adobe Stack — Guided Fallback)
+
+**Use when** Workflow 2 cannot run. Specifically:
+- Fresh EDS project without a preview URL yet
+- Agent does not have git push access to the repo
+- User explicitly wants a step-by-step walkthrough with checkpoints they approve one at a time
 
 **Read:** `workflows/martech-migration.md` for the complete workflow.
 
-**Key difference:** Personalization must load in the eager phase (before first paint) to avoid content flicker. Analytics fires after LCP. The Launch container loads at 3s with remaining tags.
+**Key difference from Workflow 2:** Workflow 1 produces the same code but leaves deploy + validation to the developer. It has six explicit checkpoints (audit → config → data layer → approach → plan → apply → validate → cleanup → summary) so each step is reviewable before the next.
 
 **Output:** Plugin-based integration using `aem-martech` with:
 - `scripts/scripts.js` — alloy initialization in `loadEager`
 - `scripts/delayed.js` — Launch container for remaining tags
 - `head.html` — preconnect to `edge.adobedc.net`
-- Validation via deep-PSI and network comparison
-
-### Workflow 2: Agentic Optimization Loop (Adobe Stack — Automated)
-
-**Use when** any of these apply:
-- User says "automate", "optimize", "iterate until it works", "benchmark", or "run the agentic loop"
-- Migration needs iterative performance validation (not just code generation)
-- Stack is hybrid or complex (e.g., dual GTM + Launch, custom data layer schema)
-- A previous migration exists but performance has regressed or benchmarks are unmet
-- User asks to "migrate and validate" end-to-end without manual steps
-
-**Read:** `workflows/agentic-optimization-loop.md` for the full 8-phase loop.
-
-**How it differs from Workflow 1:** The agent autonomously captures a performance baseline, analyzes the container, selects the migration strategy, applies instrumentation, deploys to preview, measures performance, detects regressions, and iterates — up to N cycles — before presenting results for human approval. The developer reviews and approves; the agent does the iteration.
-
-**Output:** Same code artifacts as Workflow 1, plus:
-- Baseline vs. post-migration network call comparison
-- Core Web Vitals delta (LCP, CLS, TBT)
-- Iteration log with strategy and outcome per cycle
-- Human escalation report if target cannot be reached
+- Validation via deep-PSI and network comparison (run manually by the developer)
 
 ### Workflow 3: Standard Integration (Default)
 
@@ -119,7 +120,7 @@ Execute these steps in order:
 | Step | Action | Checkpoint |
 |------|--------|------------|
 | **1. Audit** | Read `references/extraction-scripts.md`, then run extraction scripts to detect scripts, globals, cookies, and third-party domains | `[CHECKPOINT 1: AUDIT COMPLETE]` |
-| **1.5. Route** | Select workflow: Workflow 1 (guided Adobe), Workflow 2 (agentic Adobe), or Workflow 3 (standard) | `[CHECKPOINT 1.5: WORKFLOW SELECTED]` |
+| **1.5. Route** | Select workflow: Workflow 2 (agentic Adobe — default when preview + push access exist), Workflow 1 (guided Adobe — fallback when they don't), or Workflow 3 (non-Adobe integrations) | `[CHECKPOINT 1.5: WORKFLOW SELECTED]` |
 | **2. Categorize** | Use the **Integration Routing Table** and **Categorization Reference** below to map each detected integration to its EDS file placement | `[CHECKPOINT 2: CATEGORIZED]` |
 | **3. Report** | Present a summary table (integration → file → approach → load order) and wait for user confirmation | `[CHECKPOINT 3: REPORTED TO USER]` |
 | **4. Generate** | For each confirmed integration, in **load order** (consent → personalization → analytics → utilities): read its file from `integrations/` using the routing table, then write the code to the correct project file | `[CHECKPOINT 4: CODE GENERATED]` |

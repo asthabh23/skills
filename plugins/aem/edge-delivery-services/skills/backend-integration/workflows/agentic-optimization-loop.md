@@ -122,39 +122,56 @@ Use Playwright to intercept all third-party requests on the original site, then 
 Deep PSI (`https://tools.aem.live/tools/deep-psi/deep-psi.html`) runs multiple PSI iterations and applies t-tests for statistical reliability. Use Playwright to drive it — it has no public API endpoint.
 
 ```javascript
+// Installs Playwright + Chromium on demand. Both steps are no-ops when
+// already present, so calling this at loop startup is safe.
+async function ensurePlaywright() {
+  const { execSync } = require('child_process');
+  try { require.resolve('playwright'); }
+  catch { execSync('npm install --no-save playwright', { stdio: 'inherit' }); }
+  execSync('npx playwright install chromium', { stdio: 'inherit' });
+  return require('playwright');
+}
+
+// Drives deep-PSI via Playwright and parses metrics from page text. We match
+// on text rather than DOM selectors because the tool's markup is not a stable
+// contract. Throws on parse failure so the caller falls back instead of
+// feeding bogus zeros into the optimization loop.
 async function captureDeepPsi(url, label = 'baseline') {
-  const deepPsiUrl = `https://tools.aem.live/tools/deep-psi/deep-psi.html`;
-
-  // 1. Open deep-PSI in Playwright browser
-  await playwright.navigate(deepPsiUrl);
-
-  // 2. Fill in the URL field and submit
-  await playwright.fill('input[name="url"], input[type="url"]:first-of-type', url);
-  await playwright.click('button[type="submit"], button:has-text("Submit")');
-
-  // 3. Wait for results — deep-PSI runs multiple PSI iterations, allow up to 3 minutes
-  await playwright.waitForSelector('.results, [data-metric="lcp"]', { timeout: 180000 });
-
-  // 4. Extract metric averages from the results table
-  const metrics = await playwright.evaluate(() => {
-    const getText = (selector) =>
-      parseFloat(document.querySelector(selector)?.textContent?.replace(/[^0-9.]/g, '') || '0');
-    return {
-      lcp: getText('[data-metric="lcp"] .average, .lcp-avg'),
-      cls: getText('[data-metric="cls"] .average, .cls-avg'),
-      tbt: getText('[data-metric="tbt"] .average, .tbt-avg'),
-      fcp: getText('[data-metric="fcp"] .average, .fcp-avg'),
-      performanceScore: getText('[data-metric="performance"] .average, .perf-avg'),
+  const { chromium } = await ensurePlaywright();
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.goto('https://tools.aem.live/tools/deep-psi/deep-psi.html');
+    await page.fill('input[type="url"], input[name="url"]', url);
+    await page.click('button[type="submit"], button:has-text("Run"), button:has-text("Submit")');
+    // Deep-PSI runs several Lighthouse passes; the results text appears when done.
+    await page.waitForFunction(
+      () => /Largest Contentful Paint/i.test(document.body.innerText),
+      { timeout: 300000 },
+    );
+    const text = await page.evaluate(() => document.body.innerText);
+    const find = (re) => {
+      const m = text.match(re);
+      return m ? parseFloat(m[1]) : NaN;
     };
-  });
-
-  return { label, url, timestamp: Date.now(), ...metrics };
+    const metrics = {
+      lcp: find(/Largest Contentful Paint[^0-9]*([0-9.]+)/i),
+      cls: find(/Cumulative Layout Shift[^0-9]*([0-9.]+)/i),
+      tbt: find(/Total Blocking Time[^0-9]*([0-9.]+)/i),
+      fcp: find(/First Contentful Paint[^0-9]*([0-9.]+)/i),
+      performanceScore: find(/Performance\s*Score[^0-9]*([0-9.]+)/i),
+    };
+    if (Object.values(metrics).every(Number.isNaN)) {
+      throw new Error('DEEP_PSI_EXTRACTION_FAILED: no metrics parsed');
+    }
+    return { label, url, timestamp: Date.now(), source: 'deep-psi', ...metrics };
+  } finally {
+    await browser.close();
+  }
 }
 ```
 
-> **Note:** If Playwright is not available, fall back to a single Google PSI API call:
-> `GET https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=<URL>&strategy=mobile`
-> This gives one data point without statistical averaging.
+> **Fallback:** On failure, `measurePerformance` falls back to `captureGooglePsiAveraged` — multiple PSI API calls averaged — so baseline and iteration measurements remain comparable. A single PSI sample is too noisy to use directly.
 
 **Capture:**
 - LCP (Largest Contentful Paint)
@@ -256,6 +273,19 @@ Select the plugin template for the chosen strategy and populate config variables
 
 > All current EDS repos use `aem.js` — confirm with `detectBoilerplate(scriptsJs)` before generating code. See [Boilerplate Compatibility](#boilerplate-compatibility).
 
+### Step 3.1a: Re-implement Consent Gating (Required)
+
+**This is not optional.** Consent checks that previously lived inside the container no longer protect the personalization and analytics calls we just extracted into `scripts.js`. Without re-implementing them, martech calls will fire before the user has given consent — a GDPR/CCPA violation.
+
+For every extraction:
+
+1. Identify the consent tool in use (OneTrust, Cookiebot, custom) from Phase 0 baseline.
+2. Gate the eager alloy init on `hasPersonalizationConsent()`.
+3. Gate the lazy page-view beacon on `hasAnalyticsConsent()`.
+4. Subscribe to the consent tool's change event so calls fire after late-granted consent.
+
+**Implementation:** See [`references/consent-gated-architecture.md`](../references/consent-gated-architecture.md) for `hasAnalyticsConsent`, `hasPersonalizationConsent`, OneTrust event listener patterns, and the complete consent-gated `loadEager` structure.
+
 ### Step 3.2: Apply Changes to Codebase
 
 ```javascript
@@ -300,60 +330,64 @@ Use the same `captureDeepPsi` function defined in Phase 0 — it drives the deep
 
 ```javascript
 async function measurePerformance(previewUrl, label = 'iteration') {
-  // Primary: Playwright-driven deep-PSI (multi-run, statistically reliable)
   try {
     return await captureDeepPsi(previewUrl, label);
   } catch (e) {
-    // Fallback: single Google PSI API call if Playwright unavailable
-    console.warn('Deep-PSI via Playwright failed, falling back to single PSI call:', e.message);
-    return await captureGooglePsi(previewUrl, label);
+    console.warn(`Deep-PSI failed (${e.message}); falling back to averaged PSI`);
+    return await captureGooglePsiAveraged(previewUrl, label);
   }
 }
 
-async function captureGooglePsi(url, label) {
-  const apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile`;
-  const response = await fetch(apiUrl);
-  const results = await response.json();
-  const audits = results.lighthouseResult.audits;
-  return {
-    label, url, timestamp: Date.now(),
-    lcp: audits['largest-contentful-paint'].numericValue,
-    cls: audits['cumulative-layout-shift'].numericValue,
-    tbt: audits['total-blocking-time'].numericValue,
-    fcp: audits['first-contentful-paint'].numericValue,
-    performanceScore: results.lighthouseResult.categories.performance.score * 100,
-  };
+// Averages N PSI API calls. A single PSI run is too noisy to drive the loop;
+// deep-PSI averages ~9 runs, so 5 here is a reasonable trade-off between
+// noise smoothing and API quota.
+async function captureGooglePsiAveraged(url, label, runs = 5) {
+  const keys = ['lcp', 'cls', 'tbt', 'fcp', 'performanceScore'];
+  const sums = Object.fromEntries(keys.map((k) => [k, 0]));
+  for (let i = 0; i < runs; i++) {
+    const res = await fetch(
+      `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile`,
+    );
+    if (!res.ok) throw new Error(`PSI_API_FAILED: HTTP ${res.status}`);
+    const { lighthouseResult: lhr } = await res.json();
+    sums.lcp += lhr.audits['largest-contentful-paint'].numericValue;
+    sums.cls += lhr.audits['cumulative-layout-shift'].numericValue;
+    sums.tbt += lhr.audits['total-blocking-time'].numericValue;
+    sums.fcp += lhr.audits['first-contentful-paint'].numericValue;
+    sums.performanceScore += lhr.categories.performance.score * 100;
+  }
+  const avg = Object.fromEntries(keys.map((k) => [k, sums[k] / runs]));
+  return { label, url, timestamp: Date.now(), source: 'psi-api-averaged', runs, ...avg };
 }
 ```
 
 ### Step 4.3: Calculate Performance Delta
 
 ```javascript
+// Deltas with a 5% noise tolerance — PSI run-to-run variance is ~5%, so
+// changes within that band are treated as flat, not improvement/regression.
 function calculatePerformanceDelta(baseline, current) {
+  const NOISE = 0.05;
+  const assess = (key) => {
+    const delta = current[key] - baseline[key];
+    const floor = Math.abs(baseline[key]) * NOISE;
+    return {
+      baseline: baseline[key],
+      current: current[key],
+      delta,
+      improved: delta < -floor,
+      regressed: delta > floor,
+    };
+  };
+  const lcp = assess('lcp');
+  const cls = assess('cls');
+  const tbt = assess('tbt');
   return {
-    lcp: { 
-      baseline: baseline.lcp, 
-      current: current.lcp, 
-      delta: current.lcp - baseline.lcp,
-      improved: current.lcp < baseline.lcp
-    },
-    cls: { 
-      baseline: baseline.cls, 
-      current: current.cls, 
-      delta: current.cls - baseline.cls,
-      improved: current.cls < baseline.cls
-    },
-    tbt: { 
-      baseline: baseline.tbt, 
-      current: current.tbt, 
-      delta: current.tbt - baseline.tbt,
-      improved: current.tbt < baseline.tbt
-    },
-    overallImproved: (
-      current.lcp <= baseline.lcp &&
-      current.cls <= baseline.cls &&
-      current.tbt <= baseline.tbt
-    )
+    lcp,
+    cls,
+    tbt,
+    overallImproved: (lcp.improved || cls.improved || tbt.improved)
+      && !(lcp.regressed || cls.regressed || tbt.regressed),
   };
 }
 ```
@@ -410,11 +444,42 @@ function compareNetworkCalls(baseline, current) {
   return report;
 }
 
+// Determines whether two network calls represent the same event. Ignoring
+// query strings entirely collapses distinct beacons (e.g., two different
+// Analytics event types hitting /b/ss/rsid) into a single match and hides real
+// regressions. We match on hostname + pathname plus a small set of identifying
+// query params that mark what the call actually is.
+//
+// IDENTIFYING_PARAMS is conservative: only params known to distinguish event
+// type for common martech endpoints. Timestamps, session IDs, and cache
+// busters are deliberately excluded so run-to-run jitter doesn't cause false
+// positive regressions.
+const IDENTIFYING_PARAMS = [
+  'en',         // GA4 event_name
+  't',          // GA classic hit type (pageview, event, ...)
+  'pe',         // Adobe Analytics event type
+  'events',     // Adobe Analytics events list
+  'type',       // WebSDK event type (e.g., "decisioning.propositionDisplay")
+  'eventType',  // alternate casing
+  'tid',        // GA tracking id
+  'rsid',       // Adobe Analytics report suite id
+];
+
 function callsMatch(call1, call2) {
-  // Match by domain and path, ignore query params and timestamps
   const url1 = new URL(call1.url);
   const url2 = new URL(call2.url);
-  return url1.hostname === url2.hostname && url1.pathname === url2.pathname;
+  if (url1.hostname !== url2.hostname) return false;
+  if (url1.pathname !== url2.pathname) return false;
+
+  // For endpoints where the path alone doesn't identify the event (Analytics,
+  // GA, WebSDK all use a single endpoint for many event types), require the
+  // identifying params to also match.
+  for (const param of IDENTIFYING_PARAMS) {
+    const v1 = url1.searchParams.get(param);
+    const v2 = url2.searchParams.get(param);
+    if (v1 !== v2) return false;
+  }
+  return true;
 }
 ```
 
@@ -489,65 +554,126 @@ function evaluateIteration(performanceDelta, regressionReport, iteration) {
 When performance hasn't improved, try these adjustments:
 
 ```javascript
+const fs = require('fs');
+const path = require('path');
+
+// Each strategy mutates project files and returns { changed, file? }.
+// Strategies are idempotent: the condition checks inside guarantee that
+// running the same strategy twice is a no-op.
 const OPTIMIZATION_STRATEGIES = [
   {
     name: 'defer_non_critical_tags',
-    description: 'Move more tags from container to delayed phase',
+    description: 'Switch delayed.js from setTimeout(3000) to requestIdleCallback',
     apply: async (repoPath) => {
-      // Identify tags that can be deferred further
-    }
-  },
-  {
-    name: 'lazy_load_alloy',
-    description: 'Load alloy.js asynchronously if no personalization',
-    condition: (analysis) => analysis.personalization.length === 0,
-    apply: async (repoPath) => {
-      // Change from sync to async alloy loading
-    }
-  },
-  {
-    name: 'reduce_data_layer_payload',
-    description: 'Trim unnecessary data layer fields',
-    apply: async (repoPath) => {
-      // Analyze and remove unused data layer fields
-    }
+      const file = path.join(repoPath, 'scripts/delayed.js');
+      const src = fs.readFileSync(file, 'utf8');
+      if (src.includes('requestIdleCallback')) return { changed: false };
+      const next = src.replace(
+        /setTimeout\(\s*([A-Za-z_$][\w$]*)\s*,\s*3000\s*\)/,
+        `('requestIdleCallback' in window ? requestIdleCallback($1, { timeout: 5000 }) : setTimeout($1, 3000))`,
+      );
+      if (next === src) return { changed: false };
+      fs.writeFileSync(file, next);
+      return { changed: true, file: 'scripts/delayed.js' };
+    },
   },
   {
     name: 'add_preconnects',
-    description: 'Add preconnect hints for third-party domains',
-    apply: async (repoPath, networkCalls) => {
-      const domains = [...new Set(networkCalls.map(c => new URL(c.url).hostname))];
-      // Add preconnect for critical domains
-    }
-  }
+    description: 'Add preconnect hints to head.html for the top third-party domains by call volume',
+    // Skipped if no network calls were captured in the current iteration.
+    condition: (ctx) => ctx.networkCalls?.length > 0,
+    apply: async (repoPath, { networkCalls }) => {
+      // Rank domains by call count — preconnecting the busiest ones gives the
+      // biggest DNS/TLS savings for the delayed phase.
+      const counts = networkCalls.reduce((acc, c) => {
+        const host = new URL(c.url).hostname;
+        acc.set(host, (acc.get(host) ?? 0) + 1);
+        return acc;
+      }, new Map());
+      const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+      const file = path.join(repoPath, 'head.html');
+      const src = fs.readFileSync(file, 'utf8');
+      const tags = top
+        .filter(([host]) => !src.includes(`href="https://${host}"`))
+        .map(([host]) => `<link rel="preconnect" href="https://${host}" crossorigin>`);
+      if (tags.length === 0) return { changed: false };
+      fs.writeFileSync(file, `${src}\n${tags.join('\n')}\n`);
+      return { changed: true, file: 'head.html', added: tags.length };
+    },
+  },
 ];
 ```
+
+> Additional strategies (`lazy_load_alloy`, `reduce_data_layer_payload`) require project-specific markers or data-layer schema we don't yet emit consistently. They're deferred until the aem-martech template adds stable anchors — tracking under **Open Questions & Risks**.
 
 ### Step 6.3: Regression Fixes
 
 When regressions are detected:
 
 ```javascript
+const fsp = require('fs/promises');
+
+// Returns a list of human-readable findings per missing call. We don't
+// auto-mutate on regression — regressions almost always signal an error in the
+// extracted instrumentation, and the safer default is to surface the diagnosis
+// and escalate. Auto-patching regressions risks making the problem worse.
 async function fixRegressions(repoPath, regressionReport) {
+  const findings = [];
   for (const missing of regressionReport.critical) {
-    const category = missing.category;
-    
-    if (category === 'analytics') {
-      // Analytics call missing - check data layer population
-      await verifyDataLayerPopulation(repoPath);
-    } else if (category === 'personalization') {
-      // Personalization call missing - check alloy configuration
-      await verifyAlloyConfiguration(repoPath);
-    } else if (category === 'consent') {
-      // Consent call missing - check OneTrust loading
-      await verifyConsentLoading(repoPath);
-    } else {
-      // Other third-party call missing - ensure container still loads it
-      await verifyContainerInclusion(repoPath, missing.url);
-    }
+    findings.push(await diagnoseMissingCall(repoPath, missing));
+  }
+  return findings;
+}
+
+async function diagnoseMissingCall(repoPath, missing) {
+  const read = async (rel) => {
+    try { return await fsp.readFile(path.join(repoPath, rel), 'utf8'); }
+    catch { return null; }
+  };
+  const host = new URL(missing.url).hostname;
+  const scripts = await read('scripts/scripts.js') ?? '';
+  const delayed = await read('scripts/delayed.js') ?? '';
+
+  switch (missing.category) {
+    case 'analytics':
+      // Analytics payload requires both a configured datastream AND a populated
+      // data layer before sendEvent fires. Either missing → no beacon.
+      return {
+        url: missing.url,
+        category: 'analytics',
+        hasDatastreamConfig: /datastreamId|datastream_id/.test(scripts),
+        hasSendEvent: /sendEvent|pageView/.test(scripts),
+        recommendation: 'Verify datastream ID is set and sendEvent is called in loadLazy after the data layer is populated.',
+      };
+    case 'personalization':
+      return {
+        url: missing.url,
+        category: 'personalization',
+        alloyInEager: /loadEager[\s\S]*?alloy/.test(scripts),
+        recommendation: 'Ensure alloy is configured and awaited inside loadEager before first section renders.',
+      };
+    case 'consent':
+      return {
+        url: missing.url,
+        category: 'consent',
+        consentScriptReferenced: /OneTrust|Optanon|cookielaw/i.test(scripts + delayed),
+        recommendation: 'Confirm the consent script is loaded early (before loadDelayed) and its callback fires.',
+      };
+    default:
+      // Generic third-party tags should still come from the container loaded
+      // in delayed.js — check that the original container URL is intact.
+      return {
+        url: missing.url,
+        category: missing.category,
+        containerStillLoaded: delayed.includes(host) || /loadScript.*adobedtm|googletagmanager/.test(delayed),
+        recommendation: 'Confirm the original container URL is loaded in delayed.js and the tag is still present in the container.',
+      };
   }
 }
 ```
+
+> The diagnostic output is returned to the loop and attached to the iteration record so the human reviewer can act on it. We deliberately avoid auto-rewriting code on regression — see Success Criteria: any failing criterion triggers another iteration, then escalates.
 
 ---
 
@@ -630,64 +756,61 @@ ${manualChecks.join('\n')}
 
 ```javascript
 async function runOptimizationLoop(config) {
-  const MAX_ITERATIONS = 5;
+  const maxIterations = config.optimization?.max_iterations ?? 5;
   const iterations = [];
-  
-  // Phase 0: Capture baseline
+
+  // Phase 0 — baseline. Performance and network are captured on the original
+  // site so every iteration compares against the same reference point.
   const baseline = {
-    network: await captureNetworkBaseline(config.siteUrl),
-    performance: await measurePerformance(config.siteUrl)
+    network: await captureNetworkBaseline(config.source.site_url),
+    performance: await measurePerformance(config.source.site_url, 'baseline'),
   };
 
-  // Phase 1: Analyze container
+  // Phase 1–2 run once: analysis and strategy don't change across iterations.
   const containerAnalysis = await analyzeContainer(config);
+  const strategy = selectStrategy(containerAnalysis);
 
-  // Phase 2: Select strategy (recorded in migration plan)
-  const migrationStrategy = selectStrategy(containerAnalysis);
-
-  for (let i = 1; i <= MAX_ITERATIONS; i++) {
+  for (let i = 1; i <= maxIterations; i++) {
     console.log(`\n=== Iteration ${i} ===\n`);
 
-    // Phase 3: Apply instrumentation
-    const migrationPlan = generateMigrationPlan(migrationStrategy, containerAnalysis, i);
-    await applyInstrumentation(config.repoPath, migrationPlan);
+    // Phase 3 — apply instrumentation. On iteration 1 this is the full
+    // migration; later iterations layer on optimizations from the previous
+    // iteration's result.
+    const plan = generateMigrationPlan(strategy, containerAnalysis, i);
+    await applyInstrumentation(config.target.repo_path, plan);
 
-    // Phase 4: Deploy and measure
-    await deployToPreview(config.repoPath);
-    const currentPerformance = await measurePerformance(config.previewUrl);
+    // Phase 4 — deploy, then measure on the preview URL.
+    await deployToPreview(config.target);
+    const currentPerformance = await measurePerformance(config.target.preview_url, `iter-${i}`);
     const performanceDelta = calculatePerformanceDelta(baseline.performance, currentPerformance);
 
-    // Phase 5: Verify regressions
-    const currentNetwork = await captureNetworkBaseline(config.previewUrl);
+    // Phase 5 — network regression check.
+    const currentNetwork = await captureNetworkBaseline(config.target.preview_url);
     const regressionReport = compareNetworkCalls(baseline.network, currentNetwork);
 
-    // Phase 6: Evaluate & decide
+    // Phase 6 — decide what to do next.
     const decision = evaluateIteration(performanceDelta, regressionReport, i);
-    
-    iterations.push({
-      iteration: i,
-      migrationPlan,
-      performanceDelta,
-      regressionReport,
-      decision
-    });
-    
-    // Check if we should stop
+    const record = { iteration: i, plan, performanceDelta, regressionReport, decision };
+
     if (decision.status === 'SUCCESS') {
-      console.log('✅ Migration successful - proceeding to human review');
+      iterations.push(record);
       break;
-    } else if (decision.status === 'REGRESSION') {
-      console.log('⚠️ Regression detected - attempting fix');
-      await fixRegressions(config.repoPath, regressionReport);
-    } else if (decision.nextAction === 'ATTEMPT_OPTIMIZATION') {
-      console.log('📈 Attempting optimization');
-      await applyOptimizationStrategy(config.repoPath, i);
     }
+    if (decision.status === 'REGRESSION') {
+      // Surface diagnostics for the human reviewer; don't auto-patch.
+      record.diagnostics = await fixRegressions(config.target.repo_path, regressionReport);
+    } else if (decision.nextAction === 'ATTEMPT_OPTIMIZATION') {
+      // Strategies need both the container analysis and the current network
+      // capture to make meaningful choices (e.g., which domains to preconnect).
+      record.optimizations = await applyOptimizationStrategy(config.target.repo_path, i, {
+        containerAnalysis,
+        networkCalls: currentNetwork.all,
+      });
+    }
+    iterations.push(record);
   }
-  
-  // Phase 7: Human review
-  const reviewPackage = generateReviewPackage(iterations);
-  return reviewPackage;
+
+  return generateReviewPackage(iterations);
 }
 ```
 
@@ -758,27 +881,32 @@ function generateMigrationPlan(strategy, containerAnalysis, iteration) {
 }
 
 function selectOptimizationForIteration(iteration) {
-  // Cycle through strategies on successive iterations
-  return [OPTIMIZATION_STRATEGIES[(iteration - 2) % OPTIMIZATION_STRATEGIES.length]];
+  // iteration is 1-indexed; the first optimization runs on iteration 2.
+  return OPTIMIZATION_STRATEGIES[(iteration - 2) % OPTIMIZATION_STRATEGIES.length];
 }
 
-// Apply the chosen optimization strategy from the OPTIMIZATION_STRATEGIES array
-async function applyOptimizationStrategy(repoPath, iteration) {
-  const strategies = selectOptimizationForIteration(iteration);
-  for (const strategy of strategies) {
-    if (!strategy.condition || strategy.condition({})) {
-      await strategy.apply(repoPath);
-      console.log(`Applied optimization: ${strategy.name}`);
-    }
+// Runs the iteration's optimization strategy if its condition passes, threading
+// through the container analysis and current network capture so strategies can
+// make data-driven choices (e.g., which domains to preconnect).
+async function applyOptimizationStrategy(repoPath, iteration, context) {
+  const strategy = selectOptimizationForIteration(iteration);
+  if (strategy.condition && !strategy.condition(context)) {
+    return { skipped: strategy.name, reason: 'condition not met' };
   }
+  const result = await strategy.apply(repoPath, context);
+  return { name: strategy.name, ...result };
 }
 
-// Push to preview branch and wait for AEM Code Sync
-async function deployToPreview(repoPath) {
+// Pushes to the configured preview branch and waits for AEM Code Sync. The
+// branch is read from config so multi-branch workflows (e.g., parallel
+// experiments) don't collide on a hardcoded name.
+async function deployToPreview(target) {
   const { execSync } = require('child_process');
-  execSync('git push origin martech-migration', { cwd: repoPath, stdio: 'inherit' });
-  // Poll for AEM Code Sync (up to 60s)
-  await new Promise(resolve => setTimeout(resolve, 30000));
+  const branch = target.branch ?? 'martech-migration';
+  execSync(`git push origin ${branch}`, { cwd: target.repo_path, stdio: 'inherit' });
+  // AEM Code Sync webhook latency is usually <30s; give it a fixed pause
+  // before measurement to avoid racing the preview URL.
+  await new Promise((resolve) => setTimeout(resolve, 30000));
 }
 ```
 
@@ -1004,9 +1132,21 @@ WebSDK v2.34.0+ of the Launch extension supports native container splitting. Ref
 ### Detection
 
 ```javascript
-function detectWebSDKVersion(containerUrl) {
-  // Fetch and parse container to find alloy version
-  // If >= 2.34.0, native splitting is available
+// Fetches the Launch container bundle and reads the alloy version embedded
+// inside it. Returns null when the version cannot be determined so callers
+// fall back to the manual aem-martech path rather than misapplying native
+// splitting on an older runtime.
+async function detectWebSDKVersion(containerUrl) {
+  const source = await fetch(containerUrl).then((r) => r.text());
+  // alloy bundles include a version banner like: "alloy":"2.34.0" or
+  // libVersion:"2.34.0". Match either form.
+  const match = source.match(/(?:alloy|libVersion)["':\s]+(\d+\.\d+\.\d+)/i);
+  if (!match) return null;
+  const [major, minor] = match[1].split('.').map(Number);
+  return {
+    version: match[1],
+    supportsNativeSplitting: major > 2 || (major === 2 && minor >= 34),
+  };
 }
 ```
 
