@@ -3,7 +3,7 @@ name: find-test-content
 description: Search for existing content pages containing a specific block in AEM Edge Delivery Services. Reports URLs with occurrences and variants to help identify test content during development.
 license: Apache-2.0
 metadata:
-  version: "1.2.0"
+  version: "1.0.0"
 ---
 
 # Find Test Content
