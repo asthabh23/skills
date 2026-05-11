@@ -25,6 +25,8 @@ Everything else — cookie consent, social pixels, RUM, remaining analytics even
 
 ## Overview
 
+![Agentic optimization loop — overview](agentic-loop-overview.png)
+
 ```
 ┌──────────────────────── ONE-TIME SETUP ────────────────────────┐
 │                                                                 │
@@ -749,6 +751,12 @@ ${manualChecks.join('\n')}
 
 ### Approve or Request Changes?
 ```
+
+---
+
+## Detailed Flow
+
+![Agentic optimization loop — detailed flow](agentic-optimization-loop.png)
 
 ---
 
