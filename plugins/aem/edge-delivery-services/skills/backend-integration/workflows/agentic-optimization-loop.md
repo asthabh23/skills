@@ -1188,14 +1188,3 @@ This reduces the need for manual alloy.js wiring but still requires:
 | **Hybrid GTM + Launch scenarios** — Adds complexity | Support dual martech pattern; clearly document which container handles what |
 | **Cookie consent interaction** — Extracting tags breaks consent gating | Re-implement consent checks in EDS code; test with consent denied |
 
----
-
-## Diagrams
-
-Visual representations of this workflow are available:
-
-- **Detailed flow:** `agentic-optimization-loop.puml`
-- **Overview:** `agentic-loop-overview.puml`
-
-Render with PlantUML: `plantuml agentic-optimization-loop.puml`
-
