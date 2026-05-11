@@ -119,70 +119,20 @@ Use Playwright to intercept all third-party requests on the original site, then 
 
 **Output:** `baseline-network-calls.json`
 
-### Step 0.2: Capture Performance Baseline
+### Step 0.2: Note the Baseline URL
 
-Deep PSI (`https://tools.aem.live/tools/deep-psi/deep-psi.html`) runs multiple PSI iterations and applies t-tests for statistical reliability. Use Playwright to drive it — it has no public API endpoint.
+Deep-PSI is a **two-URL comparison tool**: it runs multiple Lighthouse passes against both URLs in the same session (shared cache state, same cache-busting logic, same pass count) and returns a statistical verdict per metric. The loop uses it end-to-end — baseline and iteration are measured together in Phase 4, not separately.
+
+This means Phase 0 doesn't need to capture performance numbers on their own. Record the original URL so Phase 4 can pass it to Deep-PSI alongside the preview URL each iteration.
 
 ```javascript
-// Installs Playwright + Chromium on demand. Both steps are no-ops when
-// already present, so calling this at loop startup is safe.
-async function ensurePlaywright() {
-  const { execSync } = require('child_process');
-  try { require.resolve('playwright'); }
-  catch { execSync('npm install --no-save playwright', { stdio: 'inherit' }); }
-  execSync('npx playwright install chromium', { stdio: 'inherit' });
-  return require('playwright');
-}
-
-// Drives deep-PSI via Playwright and parses metrics from page text. We match
-// on text rather than DOM selectors because the tool's markup is not a stable
-// contract. Throws on parse failure so the caller falls back instead of
-// feeding bogus zeros into the optimization loop.
-async function captureDeepPsi(url, label = 'baseline') {
-  const { chromium } = await ensurePlaywright();
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.goto('https://tools.aem.live/tools/deep-psi/deep-psi.html');
-    await page.fill('input[type="url"], input[name="url"]', url);
-    await page.click('button[type="submit"], button:has-text("Run"), button:has-text("Submit")');
-    // Deep-PSI runs several Lighthouse passes; the results text appears when done.
-    await page.waitForFunction(
-      () => /Largest Contentful Paint/i.test(document.body.innerText),
-      { timeout: 300000 },
-    );
-    const text = await page.evaluate(() => document.body.innerText);
-    const find = (re) => {
-      const m = text.match(re);
-      return m ? parseFloat(m[1]) : NaN;
-    };
-    const metrics = {
-      lcp: find(/Largest Contentful Paint[^0-9]*([0-9.]+)/i),
-      cls: find(/Cumulative Layout Shift[^0-9]*([0-9.]+)/i),
-      tbt: find(/Total Blocking Time[^0-9]*([0-9.]+)/i),
-      fcp: find(/First Contentful Paint[^0-9]*([0-9.]+)/i),
-      performanceScore: find(/Performance\s*Score[^0-9]*([0-9.]+)/i),
-    };
-    if (Object.values(metrics).every(Number.isNaN)) {
-      throw new Error('DEEP_PSI_EXTRACTION_FAILED: no metrics parsed');
-    }
-    return { label, url, timestamp: Date.now(), source: 'deep-psi', ...metrics };
-  } finally {
-    await browser.close();
-  }
-}
+// Baseline record is just the URL; Deep-PSI measures original and preview
+// together every iteration, keeping both sides in the same measurement
+// environment.
+const baseline = { originalUrl: config.source.site_url };
 ```
 
-> **Fallback:** On failure, `measurePerformance` falls back to `captureGooglePsiAveraged` — multiple PSI API calls averaged — so baseline and iteration measurements remain comparable. A single PSI sample is too noisy to use directly.
-
-**Capture:**
-- LCP (Largest Contentful Paint)
-- CLS (Cumulative Layout Shift)
-- TBT (Total Blocking Time)
-- FCP (First Contentful Paint)
-- Performance Score (0–100)
-
-**Output:** `baseline-performance.json`
+> **Why not measure baseline once and reuse?** Comparing a baseline captured on day 1 against preview captured on day 3 mixes measurement environments (different Lighthouse versions on the server, different cache states, different network conditions). Re-measuring the original URL each iteration — in the same Deep-PSI session as the preview URL — eliminates that drift.
 
 ---
 
@@ -330,73 +280,126 @@ git push origin martech-migration
 sleep 30
 ```
 
-### Step 4.2: Run Deep-PSI
+### Step 4.2: Run Deep-PSI Comparison
 
-Use the same `captureDeepPsi` function defined in Phase 0 — it drives the deep-PSI web UI via Playwright for statistically reliable multi-run results.
+Feed both URLs — original and preview — into Deep-PSI's comparison mode. It runs multiple Lighthouse passes against each URL in the same session, applies t-tests across the samples, and returns a per-metric verdict (`improved` / `regressed` / `flat`) with effect size. The loop treats that verdict as authoritative — we don't compute deltas locally.
 
 ```javascript
-async function measurePerformance(previewUrl, label = 'iteration') {
+// Installs Playwright + Chromium on demand. No-ops when already present, so
+// calling this at loop startup is safe.
+async function ensurePlaywright() {
+  const { execSync } = require('child_process');
+  try { require.resolve('playwright'); }
+  catch { execSync('npm install --no-save playwright', { stdio: 'inherit' }); }
+  execSync('npx playwright install chromium', { stdio: 'inherit' });
+  return require('playwright');
+}
+
+// Deep-PSI runs multiple Lighthouse passes per URL and reports each metric
+// with a significance verdict. Labels here must match the strings the tool
+// emits; centralized so ordering and naming stay consistent across the file.
+const DEEP_PSI_METRICS = [
+  { key: 'lcp', label: 'Largest Contentful Paint' },
+  { key: 'cls', label: 'Cumulative Layout Shift' },
+  { key: 'tbt', label: 'Total Blocking Time' },
+  { key: 'fcp', label: 'First Contentful Paint' },
+];
+const DEEP_PSI_CORE = ['lcp', 'cls', 'tbt']; // metrics that drive the verdict
+const DEEP_PSI_URL = 'https://tools.aem.live/tools/deep-psi/deep-psi.html';
+const DEEP_PSI_TIMEOUT_MS = 300_000;
+
+// Drives deep-PSI's two-URL comparison via Playwright. Both URLs run in the
+// same session, same pass count, same cache-busting — so the verdict reflects
+// real migration impact, not drift between measurement environments. Throws
+// on parse/timeout; the caller escalates rather than feeding bogus data into
+// the loop decision.
+async function compareWithDeepPsi(originalUrl, previewUrl, label = 'iteration') {
+  const { chromium } = await ensurePlaywright();
+  const browser = await chromium.launch({ headless: true });
   try {
-    return await captureDeepPsi(previewUrl, label);
-  } catch (e) {
-    console.warn(`Deep-PSI failed (${e.message}); falling back to averaged PSI`);
-    return await captureGooglePsiAveraged(previewUrl, label);
-  }
-}
+    const page = await browser.newPage();
+    await page.goto(DEEP_PSI_URL);
 
-// Averages N PSI API calls. A single PSI run is too noisy to drive the loop;
-// deep-PSI averages ~9 runs, so 5 here is a reasonable trade-off between
-// noise smoothing and API quota.
-async function captureGooglePsiAveraged(url, label, runs = 5) {
-  const keys = ['lcp', 'cls', 'tbt', 'fcp', 'performanceScore'];
-  const sums = Object.fromEntries(keys.map((k) => [k, 0]));
-  for (let i = 0; i < runs; i++) {
-    const res = await fetch(
-      `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(url)}&strategy=mobile`,
+    // The tool exposes two URL inputs for comparison mode. Selectors are
+    // broad (the tool's markup isn't a stable contract) but we require
+    // exactly two matches before proceeding, which catches UI changes early.
+    const inputs = page.locator('input[type="url"], input[name*="url" i]');
+    await inputs.first().waitFor({ timeout: 10_000 });
+    const count = await inputs.count();
+    if (count < 2) {
+      throw new Error(`DEEP_PSI_UI_CHANGED: expected 2 URL inputs, found ${count}`);
+    }
+    await inputs.nth(0).fill(originalUrl);
+    await inputs.nth(1).fill(previewUrl);
+    await page.click('button[type="submit"], button:has-text("Run"), button:has-text("Compare")');
+
+    // Wait until every core metric has a verdict printed — a single early
+    // match ('improved' appearing anywhere) isn't enough, since Deep-PSI
+    // streams results as passes complete.
+    await page.waitForFunction(
+      (labels) => labels.every((l) => new RegExp(`${l}[\\s\\S]{0,200}?(improved|regressed|no significant)`, 'i').test(document.body.innerText)),
+      DEEP_PSI_CORE.map((k) => DEEP_PSI_METRICS.find((m) => m.key === k).label),
+      { timeout: DEEP_PSI_TIMEOUT_MS },
     );
-    if (!res.ok) throw new Error(`PSI_API_FAILED: HTTP ${res.status}`);
-    const { lighthouseResult: lhr } = await res.json();
-    sums.lcp += lhr.audits['largest-contentful-paint'].numericValue;
-    sums.cls += lhr.audits['cumulative-layout-shift'].numericValue;
-    sums.tbt += lhr.audits['total-blocking-time'].numericValue;
-    sums.fcp += lhr.audits['first-contentful-paint'].numericValue;
-    sums.performanceScore += lhr.categories.performance.score * 100;
+
+    const text = await page.evaluate(() => document.body.innerText);
+    const result = parseDeepPsiOutput(text, { originalUrl, previewUrl, label });
+    if (DEEP_PSI_CORE.every((k) => result.metrics[k].verdict === 'unknown')) {
+      throw new Error('DEEP_PSI_EXTRACTION_FAILED: no verdicts parsed');
+    }
+    return result;
+  } finally {
+    await browser.close();
   }
-  const avg = Object.fromEntries(keys.map((k) => [k, sums[k] / runs]));
-  return { label, url, timestamp: Date.now(), source: 'psi-api-averaged', runs, ...avg };
 }
-```
 
-### Step 4.3: Calculate Performance Delta
-
-```javascript
-// Deltas with a 5% noise tolerance — PSI run-to-run variance is ~5%, so
-// changes within that band are treated as flat, not improvement/regression.
-function calculatePerformanceDelta(baseline, current) {
-  const NOISE = 0.05;
-  const assess = (key) => {
-    const delta = current[key] - baseline[key];
-    const floor = Math.abs(baseline[key]) * NOISE;
-    return {
-      baseline: baseline[key],
-      current: current[key],
-      delta,
-      improved: delta < -floor,
-      regressed: delta > floor,
-    };
+// Pure function over Deep-PSI's text output. Isolated so it can be unit tested
+// with fixture strings when Deep-PSI markup shifts.
+function parseDeepPsiOutput(text, { originalUrl, previewUrl, label }) {
+  const normalizeVerdict = (raw) => {
+    const v = raw.toLowerCase();
+    if (v.startsWith('improved')) return 'improved';
+    if (v.startsWith('regressed')) return 'regressed';
+    return 'flat'; // 'no significant change' and any other negative phrasing
   };
-  const lcp = assess('lcp');
-  const cls = assess('cls');
-  const tbt = assess('tbt');
+
+  const metrics = {};
+  for (const { key, label: name } of DEEP_PSI_METRICS) {
+    // Single regex per metric: capture the two numeric values (original and
+    // preview) and the verdict word, all within a bounded window to avoid
+    // matching across unrelated sections.
+    const re = new RegExp(
+      `${name}[\\s\\S]{0,200}?(-?\\d+(?:\\.\\d+)?)[\\s\\S]{0,50}?(-?\\d+(?:\\.\\d+)?)[\\s\\S]{0,100}?(improved|regressed|no significant[\\w\\s]*)`,
+      'i',
+    );
+    const m = text.match(re);
+    metrics[key] = m
+      ? { original: parseFloat(m[1]), preview: parseFloat(m[2]), verdict: normalizeVerdict(m[3]) }
+      : { original: null, preview: null, verdict: 'unknown' };
+  }
+
+  const overallImproved = DEEP_PSI_CORE.some((k) => metrics[k].verdict === 'improved')
+    && !DEEP_PSI_CORE.some((k) => metrics[k].verdict === 'regressed');
+  const hasRegressions = DEEP_PSI_CORE.some((k) => metrics[k].verdict === 'regressed');
+
   return {
-    lcp,
-    cls,
-    tbt,
-    overallImproved: (lcp.improved || cls.improved || tbt.improved)
-      && !(lcp.regressed || cls.regressed || tbt.regressed),
+    label,
+    originalUrl,
+    previewUrl,
+    timestamp: Date.now(),
+    source: 'deep-psi-comparison',
+    metrics,
+    overallImproved,
+    hasRegressions,
   };
 }
 ```
+
+> **Why not fall back to a different tool on failure?** A fallback that measures differently (PSI API averaging, single Lighthouse run, etc.) silently changes the measurement system mid-loop and produces incomparable numbers. If Deep-PSI fails, the loop escalates via the `DEEP_PSI_TIMEOUT` / `DEEP_PSI_EXTRACTION_FAILED` handlers in [Error Handling](#error-handling) — retry first, then human review.
+
+### Step 4.3: Use Deep-PSI's Verdict Directly
+
+No local delta math. The Phase 6 decision reads `result.overallImproved` and `result.hasRegressions` from the Deep-PSI comparison — the statistical significance is already baked in.
 
 ---
 
@@ -529,29 +532,43 @@ function generateRegressionReport(comparison) {
 ### Step 6.1: Evaluate Results
 
 ```javascript
-function evaluateIteration(performanceDelta, regressionReport, iteration) {
-  const decision = {
-    iteration,
-    performanceImproved: performanceDelta.overallImproved,
-    noRegressions: !regressionReport.hasRegressions,
-    
-    // Overall status
-    status: null,
-    nextAction: null
-  };
-  
-  if (decision.noRegressions && decision.performanceImproved) {
-    decision.status = 'SUCCESS';
-    decision.nextAction = 'PROCEED_TO_HUMAN_REVIEW';
-  } else if (decision.noRegressions && !decision.performanceImproved) {
-    decision.status = 'PARTIAL';
-    decision.nextAction = 'ATTEMPT_OPTIMIZATION';
-  } else if (!decision.noRegressions) {
-    decision.status = 'REGRESSION';
-    decision.nextAction = 'FIX_REGRESSIONS';
+// Reads the performance verdict directly from the Deep-PSI comparison result
+// (no local delta math) and combines it with the network regression report.
+// Deep-PSI already applies statistical significance across multiple Lighthouse
+// passes, so we don't re-compute noise floors here.
+//
+// Two independent regression axes:
+//   - perf regression:    a core Deep-PSI metric got significantly worse
+//   - network regression: a baseline third-party call is missing post-migration
+// Either failure short-circuits to REGRESSION.
+function evaluateIteration(comparison, regressionReport, iteration) {
+  const perfImproved = comparison.overallImproved;
+  const perfRegressed = comparison.hasRegressions;
+  const networkRegressed = regressionReport.hasRegressions;
+
+  let status;
+  let nextAction;
+  if (networkRegressed || perfRegressed) {
+    status = 'REGRESSION';
+    nextAction = 'FIX_REGRESSIONS';
+  } else if (perfImproved) {
+    status = 'SUCCESS';
+    nextAction = 'PROCEED_TO_HUMAN_REVIEW';
+  } else {
+    // Neither improved nor regressed — Deep-PSI called it flat. Try another
+    // optimization strategy before giving up.
+    status = 'PARTIAL';
+    nextAction = 'ATTEMPT_OPTIMIZATION';
   }
-  
-  return decision;
+
+  return {
+    iteration,
+    perfImproved,
+    perfRegressed,
+    networkRegressed,
+    status,
+    nextAction,
+  };
 }
 ```
 
@@ -689,46 +706,52 @@ async function diagnoseMissingCall(repoPath, missing) {
 
 ```javascript
 function generateReviewPackage(iterations) {
-  const latestIteration = iterations[iterations.length - 1];
-  
+  const last = iterations[iterations.length - 1];
+
   return {
     summary: {
       totalIterations: iterations.length,
-      finalStatus: latestIteration.decision.status,
-      performanceDelta: latestIteration.performanceDelta,
-      regressionStatus: latestIteration.regressionReport.status
+      finalStatus: last.decision.status,
+      // Full Deep-PSI comparison (per-metric verdicts + original/preview numbers)
+      comparison: last.comparison,
+      regressionStatus: last.regressionReport.status,
     },
-    
+
     filesChanged: [
       'scripts/scripts.js',
-      'scripts/delayed.js', 
+      'scripts/delayed.js',
       'head.html',
       // ... other files
     ],
-    
+
     diffLinks: {
-      scriptsJs: `https://github.com/org/repo/compare/main...martech-migration#diff-scripts-js`,
+      scriptsJs: 'https://github.com/org/repo/compare/main...martech-migration#diff-scripts-js',
       // ...
     },
-    
+
     testUrls: {
-      preview: `https://martech-migration--repo--org.aem.page/`,
-      deepPsi: `https://tools.aem.live/tools/deep-psi/deep-psi.html?url=...`
+      preview: 'https://martech-migration--repo--org.aem.page/',
+      deepPsi: 'https://tools.aem.live/tools/deep-psi/deep-psi.html',
     },
-    
+
     manualChecks: [
       '[ ] Personalization renders without flicker',
       '[ ] Analytics data appears in reports',
       '[ ] Consent banner functions correctly',
-      '[ ] No console errors related to martech'
+      '[ ] No console errors related to martech',
     ],
-    
-    iterationHistory: iterations.map(i => ({
+
+    // One row per iteration with the LCP verdict (the metric reviewers care
+    // about most) plus regression counts. Full per-metric detail is in
+    // `comparison` on each iteration record.
+    iterationHistory: iterations.map((i) => ({
       iteration: i.iteration,
       status: i.decision.status,
-      lcpDelta: i.performanceDelta.lcp.delta,
-      missingCalls: i.regressionReport.missingCount
-    }))
+      lcpVerdict: i.comparison?.metrics.lcp.verdict ?? 'unknown',
+      lcpOriginal: i.comparison?.metrics.lcp.original ?? null,
+      lcpPreview: i.comparison?.metrics.lcp.preview ?? null,
+      missingCalls: i.regressionReport.missingCount,
+    })),
   };
 }
 ```
@@ -741,7 +764,10 @@ function generateReviewPackage(iterations) {
 ### Summary
 - **Iterations:** ${totalIterations}
 - **Final Status:** ${finalStatus}
-- **Performance:** LCP ${lcpDelta > 0 ? 'regressed' : 'improved'} by ${Math.abs(lcpDelta)}ms
+- **Performance (Deep-PSI verdict):**
+  - LCP: ${comparison.metrics.lcp.verdict} (${comparison.metrics.lcp.original} → ${comparison.metrics.lcp.preview})
+  - CLS: ${comparison.metrics.cls.verdict} (${comparison.metrics.cls.original} → ${comparison.metrics.cls.preview})
+  - TBT: ${comparison.metrics.tbt.verdict} (${comparison.metrics.tbt.original} → ${comparison.metrics.tbt.preview})
 
 ### Files Changed
 ${filesChanged.map(f => `- \`${f}\``).join('\n')}
@@ -771,11 +797,14 @@ async function runOptimizationLoop(config) {
   const maxIterations = config.optimization?.max_iterations ?? 5;
   const iterations = [];
 
-  // Phase 0 — baseline. Performance and network are captured on the original
-  // site so every iteration compares against the same reference point.
+  // Phase 0 — only the network baseline is captured up front (it's cheap and
+  // doesn't suffer from measurement drift the way performance metrics do).
+  // Performance is measured fresh each iteration via Deep-PSI two-URL
+  // comparison, which re-samples the original URL alongside the preview URL
+  // in the same session.
   const baseline = {
+    originalUrl: config.source.site_url,
     network: await captureNetworkBaseline(config.source.site_url),
-    performance: await measurePerformance(config.source.site_url, 'baseline'),
   };
 
   // Phase 1–2 run once: analysis and strategy don't change across iterations.
@@ -791,18 +820,24 @@ async function runOptimizationLoop(config) {
     const plan = generateMigrationPlan(strategy, containerAnalysis, i);
     await applyInstrumentation(config.target.repo_path, plan);
 
-    // Phase 4 — deploy, then measure on the preview URL.
+    // Phase 4 — deploy, then run Deep-PSI comparison: original vs preview,
+    // measured together in one session so both sides share the same pass
+    // count, cache state, and cache-busting logic.
     await deployToPreview(config.target);
-    const currentPerformance = await measurePerformance(config.target.preview_url, `iter-${i}`);
-    const performanceDelta = calculatePerformanceDelta(baseline.performance, currentPerformance);
+    const comparison = await compareWithDeepPsi(
+      baseline.originalUrl,
+      config.target.preview_url,
+      `iter-${i}`,
+    );
 
     // Phase 5 — network regression check.
     const currentNetwork = await captureNetworkBaseline(config.target.preview_url);
     const regressionReport = compareNetworkCalls(baseline.network, currentNetwork);
 
-    // Phase 6 — decide what to do next.
-    const decision = evaluateIteration(performanceDelta, regressionReport, i);
-    const record = { iteration: i, plan, performanceDelta, regressionReport, decision };
+    // Phase 6 — decide what to do next. Deep-PSI's verdict drives the
+    // performance axis; the network report drives the regression axis.
+    const decision = evaluateIteration(comparison, regressionReport, i);
+    const record = { iteration: i, plan, comparison, regressionReport, decision };
 
     if (decision.status === 'SUCCESS') {
       iterations.push(record);
@@ -996,41 +1031,65 @@ human_review:
 
 Track across iterations:
 
-| Metric | Baseline | Iter 1 | Iter 2 | Iter 3 | Target |
-|--------|----------|--------|--------|--------|--------|
-| LCP (ms) | 3200 | 2800 | 2500 | 2400 | ≤2500 |
-| CLS | 0.15 | 0.12 | 0.08 | 0.05 | ≤0.1 |
-| TBT (ms) | 450 | 300 | 200 | 180 | ≤200 |
-| Missing Calls | 0 | 2 | 0 | 0 | 0 |
-| Status | — | REGRESSION | PARTIAL | SUCCESS | — |
+Each iteration re-runs Deep-PSI comparison against the original URL, so columns show the per-iteration verdict (Deep-PSI's own significance call) alongside the measured original → preview values.
+
+| Metric | Iter 1 | Iter 2 | Iter 3 | Target |
+|--------|--------|--------|--------|--------|
+| LCP (original → preview, ms) | 3200 → 3100 (regressed) | 3200 → 2500 (improved) | 3200 → 2400 (improved) | improved or flat |
+| CLS | 0.15 → 0.12 (flat) | 0.15 → 0.08 (improved) | 0.15 → 0.05 (improved) | improved or flat |
+| TBT (ms) | 450 → 480 (regressed) | 450 → 200 (improved) | 450 → 180 (improved) | improved or flat |
+| Missing Network Calls | 2 | 0 | 0 | 0 |
+| Status | REGRESSION | PARTIAL | SUCCESS | — |
 
 ---
 
 ## Error Handling
 
 ```javascript
+// Retry budget for Deep-PSI: the only sanctioned recovery path for
+// measurement failures. Falling back to a different tool would change the
+// measurement system mid-loop and produce incomparable numbers, so we retry
+// first and escalate if the retries don't recover.
+const DEEP_PSI_MAX_RETRIES = 2;
+
 const ERROR_HANDLERS = {
-  'API_AUTH_FAILED': async (error, config) => {
-    // Prompt for new credentials
-    return { action: 'REQUEST_CREDENTIALS', message: 'API authentication failed' };
-  },
-  
-  'CONTAINER_NOT_FOUND': async (error, config) => {
-    // Fallback to source code analysis
-    return { action: 'FALLBACK_TO_SOURCE_ANALYSIS' };
-  },
-  
-  'DEEP_PSI_TIMEOUT': async (error, config) => {
-    // Retry with longer timeout
-    return { action: 'RETRY', delay: 60000 };
-  },
-  
-  'REGRESSION_UNFIXABLE': async (error, config) => {
-    // Escalate to human
-    return { action: 'ESCALATE_TO_HUMAN', reason: error.message };
-  }
+  API_AUTH_FAILED: async () => ({
+    action: 'REQUEST_CREDENTIALS',
+    message: 'API authentication failed',
+  }),
+
+  CONTAINER_NOT_FOUND: async () => ({
+    action: 'FALLBACK_TO_SOURCE_ANALYSIS',
+  }),
+
+  // Deep-PSI is slow by design (multiple Lighthouse passes). A single timeout
+  // is usually transient network jitter; retry with back-off, then escalate.
+  DEEP_PSI_TIMEOUT: async (_error, { attempt = 0 } = {}) => (
+    attempt < DEEP_PSI_MAX_RETRIES
+      ? { action: 'RETRY', delay: 60_000 * (attempt + 1) }
+      : { action: 'ESCALATE_TO_HUMAN', reason: 'Deep-PSI repeatedly timed out — cannot measure this iteration' }
+  ),
+
+  // Parse failures usually mean the Deep-PSI UI changed. Retrying the same
+  // parse won't help, so escalate immediately rather than wasting time.
+  DEEP_PSI_EXTRACTION_FAILED: async (error) => ({
+    action: 'ESCALATE_TO_HUMAN',
+    reason: `Deep-PSI output format unrecognized: ${error.message}. Check parseDeepPsiOutput fixtures.`,
+  }),
+
+  DEEP_PSI_UI_CHANGED: async (error) => ({
+    action: 'ESCALATE_TO_HUMAN',
+    reason: `Deep-PSI UI changed: ${error.message}. Update selectors in compareWithDeepPsi.`,
+  }),
+
+  REGRESSION_UNFIXABLE: async (error) => ({
+    action: 'ESCALATE_TO_HUMAN',
+    reason: error.message,
+  }),
 };
 ```
+
+> **No fallback measurement system.** If Deep-PSI fails after retries, the loop escalates rather than silently switching to a different tool. Comparing numbers captured with different pass counts, different cache-busting logic, or different environments is worse than an explicit "measurement unavailable" — it produces decisions on measurement drift rather than real performance change.
 
 ---
 
@@ -1040,7 +1099,7 @@ The loop terminates successfully when **all four** conditions are met:
 
 | Criterion | Measure | Pass Condition |
 |-----------|---------|----------------|
-| **Performance** | Deep-PSI scores (LCP, CLS, TBT) | Equal to or better than baseline |
+| **Performance** | Deep-PSI two-URL comparison verdict (LCP, CLS, TBT) | At least one core metric `improved` and none `regressed` (Deep-PSI computes the significance; the loop does not apply its own noise floor) |
 | **No flicker** | Personalization render timing | Content visible before alloy propositions apply (no FOUC) |
 | **Analytics fires** | Network calls to `edge.adobedc.net` or GA | Page view beacon present with correct XDM / GA4 payload |
 | **No regressions** | All third-party network calls | Every call present in baseline is still present post-migration (order may differ) |
