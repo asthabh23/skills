@@ -192,33 +192,37 @@ Container analysis has two paths depending on available access. Use the API path
 
 ### Path A: Source Code Analysis (Always Available)
 
+Path A is a **three-stage pipeline**. Earlier stages are cheap and deterministic; later stages are paid but catch what earlier ones miss. This is the same pattern used across the workflow — do the free, high-confidence work first, then escalate.
+
+| Stage | What | Cost | Confidence |
+|-------|------|------|------------|
+| 1. Regex scan | Match known vendor signatures (Adobe, GTM, Optimizely, VWO, Dynamic Yield, Segment, Mixpanel, Amplitude, Heap, Hotjar, Contentsquare, OneTrust, Cookiebot, …) in the raw bundle | Free | High when matched |
+| 2. Slice + format | Extract ±4 KB character windows around *near-miss anchors* (`track`, `experiment`, `consent`, etc.) and format each slice with `prettier` | ~1 s × ≤10 slices | — |
+| 3. LLM triage | Classifier returns `{vendor, category, phase, confidence, reasoning}` per slice | Paid; capped at `MAX_LLM_SLICES=10` | Self-reported |
+
+The staged order matters: regex handles the 80% case deterministically, slicing avoids sending a 500 KB bundle to the LLM, and `MAX_LLM_SLICES` is a hard cost ceiling.
+
 ```javascript
+// Skeleton — full implementation in references/source-code-analysis.md.
 async function analyzeFromSource(scriptsJsContent, containerUrl) {
-  // 1. Detect container type from scripts.js
   const containerType = detectContainerType(scriptsJsContent);
-  // Patterns: assets.adobedtm.com → launch, googletagmanager.com → gtm
-
-  // 2. Fetch and parse the container bundle
-  const containerSource = await fetch(containerUrl).then(r => r.text());
-
-  // 3. Infer personalization presence
-  const hasPersonalization = /alloy|at\.js|target|ajo|decisioning/i.test(containerSource);
-
-  // 4. Infer analytics presence
-  const hasAnalytics = /s\.t\(\)|sendEvent.*pageView|ga4.*page_view|AppMeasurement/i.test(containerSource);
-
-  return { containerType, hasPersonalization, hasAnalytics, confidence: 'medium' };
-}
-
-function detectContainerType(scriptsJs) {
-  if (/assets\.adobedtm\.com/i.test(scriptsJs) && /googletagmanager\.com/i.test(scriptsJs)) return 'both';
-  if (/assets\.adobedtm\.com/i.test(scriptsJs)) return 'launch';
-  if (/googletagmanager\.com/i.test(scriptsJs)) return 'gtm';
-  return 'unknown';
+  const source = await fetch(containerUrl).then((r) => r.text());
+  const matches = scanSignatures(source);              // Stage 1
+  const residual = await triageResidual(source, matches); // Stages 2 + 3
+  const all = [...matches, ...residual];
+  return {
+    containerType,
+    vendors: all,
+    hasPersonalization: all.some((m) => m.category === 'personalization'),
+    hasAnalytics: all.some((m) => m.category.startsWith('analytics')),
+    confidence: all.every((m) => m.confidence === 'high') ? 'high' : 'mixed',
+  };
 }
 ```
 
-> **Flag for human review** any tags with `confidence: 'low'` — i.e., custom-named tags that don't match known patterns.
+**Implementation:** See [`references/source-code-analysis.md`](../references/source-code-analysis.md) for the full `VENDOR_SIGNATURES` table, `triageResidual` (slice + format + classify), `formatSlice` (prettier-on-demand with soft fail), `dedupeFindings`, and the LLM classifier prompt contract.
+
+> **Flag for human review** any finding where `confidence !== 'high'` — regardless of whether it came from regex or the LLM. The LLM stage expands *coverage*, not *certainty*.
 
 ### Path B: Container API Analysis (When Credentials Available)
 
@@ -1195,4 +1199,5 @@ This reduces the need for manual alloy.js wiring but still requires:
 | **Ambiguous tag identification** — Custom-named tags don't follow conventions | Use heuristics + LLM reasoning; flag low-confidence classifications |
 | **Hybrid GTM + Launch scenarios** — Adds complexity | Support dual martech pattern; clearly document which container handles what |
 | **Cookie consent interaction** — Extracting tags breaks consent gating | Re-implement consent checks in EDS code; test with consent denied |
+| **LLM cost/latency on large containers** — Path A Stage 3 sends formatted slices to an LLM; a 500 KB bundle with many anchors could trigger many calls | Bound by `MAX_LLM_SLICES=10` and ±4 KB slice windows around near-miss anchors (never the full bundle); regex-matched vendors are excluded from the prompt so the LLM only reasons about residual code |
 
