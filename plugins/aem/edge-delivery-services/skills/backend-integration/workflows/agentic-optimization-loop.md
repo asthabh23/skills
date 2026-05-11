@@ -121,7 +121,7 @@ Use Playwright to intercept all third-party requests on the original site, then 
 
 ### Step 0.2: Note the Baseline URL
 
-Deep-PSI is a **two-URL comparison tool**: it runs multiple Lighthouse passes against both URLs in the same session (shared cache state, same cache-busting logic, same pass count) and returns a statistical verdict per metric. The loop uses it end-to-end — baseline and iteration are measured together in Phase 4, not separately.
+Deep-PSI is a **two-URL comparison tool**: it runs 20 PSI iterations per URL in the same session (shared cache-busting logic, same pass count) and applies a two-sample t-test per metric. The loop uses it end-to-end — baseline and iteration are measured together in Phase 4, not separately.
 
 This means Phase 0 doesn't need to capture performance numbers on their own. Record the original URL so Phase 4 can pass it to Deep-PSI alongside the preview URL each iteration.
 
@@ -282,7 +282,12 @@ sleep 30
 
 ### Step 4.2: Run Deep-PSI Comparison
 
-Feed both URLs — original and preview — into Deep-PSI's comparison mode. It runs multiple Lighthouse passes against each URL in the same session, applies t-tests across the samples, and returns a per-metric verdict (`improved` / `regressed` / `flat`) with effect size. The loop treats that verdict as authoritative — we don't compute deltas locally.
+Feed both URLs — original and preview — into Deep-PSI's comparison form (`#url1`, `#url2`, Submit). It runs 20 PSI iterations per URL in the same session, then emits:
+
+1. A results table per URL with a stable (avg ± stddev) summary row across all runs.
+2. A **Statistical Significance Test** section (two-sample t-test, α = 0.05) that labels each metric's difference as "Significant" or "Not significant" with a p-value.
+
+Deep-PSI supplies the significance call; the loop combines that with a direction check (preview vs. original stable average, respecting that lower-is-better for time/CLS and higher-is-better for Score) to produce the per-metric verdict: `improved` / `regressed` / `flat`. No local noise floor — the t-test already filters noise.
 
 ```javascript
 // Installs Playwright + Chromium on demand. No-ops when already present, so
@@ -295,24 +300,28 @@ async function ensurePlaywright() {
   return require('playwright');
 }
 
-// Deep-PSI runs multiple Lighthouse passes per URL and reports each metric
-// with a significance verdict. Labels here must match the strings the tool
-// emits; centralized so ordering and naming stay consistent across the file.
-const DEEP_PSI_METRICS = [
-  { key: 'lcp', label: 'Largest Contentful Paint' },
-  { key: 'cls', label: 'Cumulative Layout Shift' },
-  { key: 'tbt', label: 'Total Blocking Time' },
-  { key: 'fcp', label: 'First Contentful Paint' },
-];
-const DEEP_PSI_CORE = ['lcp', 'cls', 'tbt']; // metrics that drive the verdict
+// Deep-PSI runs 20 PSI iterations per URL by default and emits (a) a per-URL
+// results table and (b) a two-sample t-test section with a p-value verdict
+// per metric. Significance comes from the tool; direction (improved vs
+// regressed) is computed here from the two stable averages.
+//
+// Columns in the results table, in order. Time metrics are in seconds; CLS
+// is unitless; Score is the Lighthouse performance score (0-100).
+const DEEP_PSI_METRICS = ['FCP', 'SI', 'LCP', 'TTI', 'TBT', 'CLS', 'Score'];
+const DEEP_PSI_CORE = ['LCP', 'CLS', 'TBT']; // drive the pass/fail decision
 const DEEP_PSI_URL = 'https://tools.aem.live/tools/deep-psi/deep-psi.html';
-const DEEP_PSI_TIMEOUT_MS = 300_000;
+const DEEP_PSI_TIMEOUT_MS = 600_000; // 20 PSI runs per URL + t-test ~ several minutes
 
-// Drives deep-PSI's two-URL comparison via Playwright. Both URLs run in the
-// same session, same pass count, same cache-busting — so the verdict reflects
-// real migration impact, not drift between measurement environments. Throws
-// on parse/timeout; the caller escalates rather than feeding bogus data into
-// the loop decision.
+// For most metrics, lower is better; Score is the exception. Direction is
+// determined by comparing preview vs original only after the t-test says the
+// difference is significant — otherwise it's noise.
+const LOWER_IS_BETTER = new Set(['FCP', 'SI', 'LCP', 'TTI', 'TBT', 'CLS']);
+
+// Drives Deep-PSI's two-URL comparison via Playwright. Both URLs run in the
+// same session, same pass count, same cache-busting logic — so the verdict
+// reflects real migration impact, not drift between measurement environments.
+// Throws on parse/timeout; the caller escalates rather than feeding bogus
+// data into the loop decision.
 async function compareWithDeepPsi(originalUrl, previewUrl, label = 'iteration') {
   const { chromium } = await ensurePlaywright();
   const browser = await chromium.launch({ headless: true });
@@ -320,67 +329,102 @@ async function compareWithDeepPsi(originalUrl, previewUrl, label = 'iteration') 
     const page = await browser.newPage();
     await page.goto(DEEP_PSI_URL);
 
-    // The tool exposes two URL inputs for comparison mode. Selectors are
-    // broad (the tool's markup isn't a stable contract) but we require
-    // exactly two matches before proceeding, which catches UI changes early.
-    const inputs = page.locator('input[type="url"], input[name*="url" i]');
-    await inputs.first().waitFor({ timeout: 10_000 });
-    const count = await inputs.count();
-    if (count < 2) {
-      throw new Error(`DEEP_PSI_UI_CHANGED: expected 2 URL inputs, found ${count}`);
-    }
-    await inputs.nth(0).fill(originalUrl);
-    await inputs.nth(1).fill(previewUrl);
-    await page.click('button[type="submit"], button:has-text("Run"), button:has-text("Compare")');
+    // The form uses concrete IDs: url1 (required), url2 (optional), plus a
+    // <button type="submit">Submit</button>.
+    await page.locator('#url1').fill(originalUrl);
+    await page.locator('#url2').fill(previewUrl);
+    await page.getByRole('button', { name: 'Submit' }).click();
 
-    // Wait until every core metric has a verdict printed — a single early
-    // match ('improved' appearing anywhere) isn't enough, since Deep-PSI
-    // streams results as passes complete.
-    await page.waitForFunction(
-      (labels) => labels.every((l) => new RegExp(`${l}[\\s\\S]{0,200}?(improved|regressed|no significant)`, 'i').test(document.body.innerText)),
-      DEEP_PSI_CORE.map((k) => DEEP_PSI_METRICS.find((m) => m.key === k).label),
-      { timeout: DEEP_PSI_TIMEOUT_MS },
-    );
+    // Completion signal: the significance-test list renders only after both
+    // URLs have finished all their PSI runs and the t-test has been computed.
+    await page.waitForSelector('#significancetestresults li', { timeout: DEEP_PSI_TIMEOUT_MS });
 
-    const text = await page.evaluate(() => document.body.innerText);
-    const result = parseDeepPsiOutput(text, { originalUrl, previewUrl, label });
-    if (DEEP_PSI_CORE.every((k) => result.metrics[k].verdict === 'unknown')) {
-      throw new Error('DEEP_PSI_EXTRACTION_FAILED: no verdicts parsed');
-    }
-    return result;
+    // Pull the DOM directly; innerText-scraping is fragile and loses the
+    // per-metric structure that #significancetestresults provides for free.
+    const raw = await page.evaluate(() => {
+      const tables = document.querySelectorAll('main table');
+      // Last row of each URL's table holds the stable average as "X (avg ± stddev)".
+      const readStableRow = (table) => {
+        if (!table) return null;
+        const rows = table.querySelectorAll('tbody tr');
+        const cells = rows[rows.length - 1]?.querySelectorAll('td');
+        return cells ? Array.from(cells).map((c) => c.textContent.trim()) : null;
+      };
+      const sig = Array.from(document.querySelectorAll('#significancetestresults li')).map((li) => ({
+        metric: li.querySelector('code')?.textContent.trim(),
+        pText: li.querySelector('.psi-sig-p')?.textContent.trim(),
+        significant: li.querySelector('.psi-sig-verdict')?.classList.contains('psi-sig-verdict-yes'),
+      }));
+      return {
+        url1Row: readStableRow(tables[0]),
+        url2Row: readStableRow(tables[1]),
+        significance: sig,
+      };
+    });
+
+    return parseDeepPsiOutput(raw, { originalUrl, previewUrl, label });
   } finally {
     await browser.close();
   }
 }
 
-// Pure function over Deep-PSI's text output. Isolated so it can be unit tested
-// with fixture strings when Deep-PSI markup shifts.
-function parseDeepPsiOutput(text, { originalUrl, previewUrl, label }) {
-  const normalizeVerdict = (raw) => {
-    const v = raw.toLowerCase();
-    if (v.startsWith('improved')) return 'improved';
-    if (v.startsWith('regressed')) return 'regressed';
-    return 'flat'; // 'no significant change' and any other negative phrasing
-  };
-
-  const metrics = {};
-  for (const { key, label: name } of DEEP_PSI_METRICS) {
-    // Single regex per metric: capture the two numeric values (original and
-    // preview) and the verdict word, all within a bounded window to avoid
-    // matching across unrelated sections.
-    const re = new RegExp(
-      `${name}[\\s\\S]{0,200}?(-?\\d+(?:\\.\\d+)?)[\\s\\S]{0,50}?(-?\\d+(?:\\.\\d+)?)[\\s\\S]{0,100}?(improved|regressed|no significant[\\w\\s]*)`,
-      'i',
-    );
-    const m = text.match(re);
-    metrics[key] = m
-      ? { original: parseFloat(m[1]), preview: parseFloat(m[2]), verdict: normalizeVerdict(m[3]) }
-      : { original: null, preview: null, verdict: 'unknown' };
+// Pure function over Deep-PSI's scraped DOM data. Separated so it can be unit
+// tested with fixture objects when the tool's markup shifts. Throws on
+// structural surprises — the loop escalates rather than guess.
+function parseDeepPsiOutput(raw, { originalUrl, previewUrl, label }) {
+  const { url1Row, url2Row, significance } = raw;
+  if (!url1Row || !url2Row) {
+    throw new Error('DEEP_PSI_EXTRACTION_FAILED: missing results table');
+  }
+  if (url1Row.length < DEEP_PSI_METRICS.length || url2Row.length < DEEP_PSI_METRICS.length) {
+    throw new Error(`DEEP_PSI_EXTRACTION_FAILED: unexpected column count (got ${url1Row.length}/${url2Row.length})`);
   }
 
-  const overallImproved = DEEP_PSI_CORE.some((k) => metrics[k].verdict === 'improved')
-    && !DEEP_PSI_CORE.some((k) => metrics[k].verdict === 'regressed');
-  const hasRegressions = DEEP_PSI_CORE.some((k) => metrics[k].verdict === 'regressed');
+  // Each table cell looks like "1.126 (1.165 ± 0.222)"; the leading number is
+  // the stable value Deep-PSI recommends using for comparison. Fall back to
+  // the parenthesized average if the stable value is missing.
+  const parseStable = (cell) => {
+    const leading = parseFloat(cell);
+    if (!Number.isNaN(leading)) return leading;
+    const m = cell.match(/\(\s*([\d.]+)/);
+    return m ? parseFloat(m[1]) : NaN;
+  };
+
+  const sigByMetric = new Map(significance.map((s) => [s.metric, s]));
+
+  const metrics = {};
+  for (let i = 0; i < DEEP_PSI_METRICS.length; i++) {
+    const m = DEEP_PSI_METRICS[i];
+    const original = parseStable(url1Row[i]);
+    const preview = parseStable(url2Row[i]);
+    const sig = sigByMetric.get(m);
+
+    let verdict;
+    if (!sig) {
+      // Score has no significance row in Deep-PSI's output; treat it as flat
+      // unless the reviewer wants it factored in later.
+      verdict = 'flat';
+    } else if (!sig.significant) {
+      verdict = 'flat';
+    } else {
+      const lowerBetter = LOWER_IS_BETTER.has(m);
+      const previewBetter = lowerBetter ? preview < original : preview > original;
+      verdict = previewBetter ? 'improved' : 'regressed';
+    }
+
+    metrics[m.toLowerCase()] = {
+      original,
+      preview,
+      pValue: sig ? parseFloat((sig.pText ?? '').replace(/[^\d.e+-]/gi, '')) : null,
+      significant: sig?.significant ?? false,
+      verdict,
+    };
+  }
+
+  const coreKeys = DEEP_PSI_CORE.map((m) => m.toLowerCase());
+  const overallImproved = coreKeys.some((k) => metrics[k].verdict === 'improved')
+    && !coreKeys.some((k) => metrics[k].verdict === 'regressed');
+  const hasRegressions = coreKeys.some((k) => metrics[k].verdict === 'regressed');
 
   return {
     label,
@@ -394,6 +438,8 @@ function parseDeepPsiOutput(text, { originalUrl, previewUrl, label }) {
   };
 }
 ```
+
+> **Units:** Deep-PSI reports time metrics (FCP, SI, LCP, TTI, TBT) in **seconds**, CLS as a unitless ratio, and Score as a 0–100 integer. `original` / `preview` in the output above carry those raw values — downstream code that renders deltas should annotate units when presenting to humans.
 
 > **Why not fall back to a different tool on failure?** A fallback that measures differently (PSI API averaging, single Lighthouse run, etc.) silently changes the measurement system mid-loop and produces incomparable numbers. If Deep-PSI fails, the loop escalates via the `DEEP_PSI_TIMEOUT` / `DEEP_PSI_EXTRACTION_FAILED` handlers in [Error Handling](#error-handling) — retry first, then human review.
 
@@ -764,10 +810,10 @@ function generateReviewPackage(iterations) {
 ### Summary
 - **Iterations:** ${totalIterations}
 - **Final Status:** ${finalStatus}
-- **Performance (Deep-PSI verdict):**
-  - LCP: ${comparison.metrics.lcp.verdict} (${comparison.metrics.lcp.original} → ${comparison.metrics.lcp.preview})
-  - CLS: ${comparison.metrics.cls.verdict} (${comparison.metrics.cls.original} → ${comparison.metrics.cls.preview})
-  - TBT: ${comparison.metrics.tbt.verdict} (${comparison.metrics.tbt.original} → ${comparison.metrics.tbt.preview})
+- **Performance (Deep-PSI verdict, t-test α = 0.05):**
+  - LCP: ${comparison.metrics.lcp.verdict} (${comparison.metrics.lcp.original}s → ${comparison.metrics.lcp.preview}s, p = ${comparison.metrics.lcp.pValue})
+  - CLS: ${comparison.metrics.cls.verdict} (${comparison.metrics.cls.original} → ${comparison.metrics.cls.preview}, p = ${comparison.metrics.cls.pValue})
+  - TBT: ${comparison.metrics.tbt.verdict} (${comparison.metrics.tbt.original}s → ${comparison.metrics.tbt.preview}s, p = ${comparison.metrics.tbt.pValue})
 
 ### Files Changed
 ${filesChanged.map(f => `- \`${f}\``).join('\n')}
@@ -1035,9 +1081,9 @@ Each iteration re-runs Deep-PSI comparison against the original URL, so columns 
 
 | Metric | Iter 1 | Iter 2 | Iter 3 | Target |
 |--------|--------|--------|--------|--------|
-| LCP (original → preview, ms) | 3200 → 3100 (regressed) | 3200 → 2500 (improved) | 3200 → 2400 (improved) | improved or flat |
+| LCP (original → preview, seconds) | 3.20 → 3.10 (regressed) | 3.20 → 2.50 (improved) | 3.20 → 2.40 (improved) | improved or flat |
 | CLS | 0.15 → 0.12 (flat) | 0.15 → 0.08 (improved) | 0.15 → 0.05 (improved) | improved or flat |
-| TBT (ms) | 450 → 480 (regressed) | 450 → 200 (improved) | 450 → 180 (improved) | improved or flat |
+| TBT (seconds) | 0.45 → 0.48 (regressed) | 0.45 → 0.20 (improved) | 0.45 → 0.18 (improved) | improved or flat |
 | Missing Network Calls | 2 | 0 | 0 | 0 |
 | Status | REGRESSION | PARTIAL | SUCCESS | — |
 
