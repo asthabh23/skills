@@ -282,7 +282,7 @@ sleep 30
 
 ### Step 4.2: Run Deep-PSI Comparison
 
-Feed both URLs — original and preview — into Deep-PSI's comparison form (`#url1`, `#url2`, Submit). It runs 20 PSI iterations per URL in the same session, then emits:
+Feed both URLs — original and preview — into Deep-PSI's comparison form. It runs 20 PSI iterations per URL in the same session, then emits:
 
 1. A results table per URL with a stable (avg ± stddev) summary row across all runs.
 2. A **Statistical Significance Test** section (two-sample t-test, α = 0.05) that labels each metric's difference as "Significant" or "Not significant" with a p-value.
@@ -290,158 +290,22 @@ Feed both URLs — original and preview — into Deep-PSI's comparison form (`#u
 Deep-PSI supplies the significance call; the loop combines that with a direction check (preview vs. original stable average, respecting that lower-is-better for time/CLS and higher-is-better for Score) to produce the per-metric verdict: `improved` / `regressed` / `flat`. No local noise floor — the t-test already filters noise.
 
 ```javascript
-// Installs Playwright + Chromium on demand. No-ops when already present, so
-// calling this at loop startup is safe.
-async function ensurePlaywright() {
-  const { execSync } = require('child_process');
-  try { require.resolve('playwright'); }
-  catch { execSync('npm install --no-save playwright', { stdio: 'inherit' }); }
-  execSync('npx playwright install chromium', { stdio: 'inherit' });
-  return require('playwright');
-}
-
-// Deep-PSI runs 20 PSI iterations per URL by default and emits (a) a per-URL
-// results table and (b) a two-sample t-test section with a p-value verdict
-// per metric. Significance comes from the tool; direction (improved vs
-// regressed) is computed here from the two stable averages.
-//
-// Columns in the results table, in order. Time metrics are in seconds; CLS
-// is unitless; Score is the Lighthouse performance score (0-100).
-const DEEP_PSI_METRICS = ['FCP', 'SI', 'LCP', 'TTI', 'TBT', 'CLS', 'Score'];
-const DEEP_PSI_CORE = ['LCP', 'CLS', 'TBT']; // drive the pass/fail decision
-const DEEP_PSI_URL = 'https://tools.aem.live/tools/deep-psi/deep-psi.html';
-const DEEP_PSI_TIMEOUT_MS = 600_000; // 20 PSI runs per URL + t-test ~ several minutes
-
-// For most metrics, lower is better; Score is the exception. Direction is
-// determined by comparing preview vs original only after the t-test says the
-// difference is significant — otherwise it's noise.
-const LOWER_IS_BETTER = new Set(['FCP', 'SI', 'LCP', 'TTI', 'TBT', 'CLS']);
-
-// Drives Deep-PSI's two-URL comparison via Playwright. Both URLs run in the
-// same session, same pass count, same cache-busting logic — so the verdict
-// reflects real migration impact, not drift between measurement environments.
-// Throws on parse/timeout; the caller escalates rather than feeding bogus
-// data into the loop decision.
+// Skeleton — full implementation in references/deep-psi-integration.md.
 async function compareWithDeepPsi(originalUrl, previewUrl, label = 'iteration') {
-  const { chromium } = await ensurePlaywright();
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const page = await browser.newPage();
-    await page.goto(DEEP_PSI_URL);
-
-    // The form uses concrete IDs: url1 (required), url2 (optional), plus a
-    // <button type="submit">Submit</button>.
-    await page.locator('#url1').fill(originalUrl);
-    await page.locator('#url2').fill(previewUrl);
-    await page.getByRole('button', { name: 'Submit' }).click();
-
-    // Completion signal: the significance-test list renders only after both
-    // URLs have finished all their PSI runs and the t-test has been computed.
-    await page.waitForSelector('#significancetestresults li', { timeout: DEEP_PSI_TIMEOUT_MS });
-
-    // Pull the DOM directly; innerText-scraping is fragile and loses the
-    // per-metric structure that #significancetestresults provides for free.
-    const raw = await page.evaluate(() => {
-      const tables = document.querySelectorAll('main table');
-      // Last row of each URL's table holds the stable average as "X (avg ± stddev)".
-      const readStableRow = (table) => {
-        if (!table) return null;
-        const rows = table.querySelectorAll('tbody tr');
-        const cells = rows[rows.length - 1]?.querySelectorAll('td');
-        return cells ? Array.from(cells).map((c) => c.textContent.trim()) : null;
-      };
-      const sig = Array.from(document.querySelectorAll('#significancetestresults li')).map((li) => ({
-        metric: li.querySelector('code')?.textContent.trim(),
-        pText: li.querySelector('.psi-sig-p')?.textContent.trim(),
-        significant: li.querySelector('.psi-sig-verdict')?.classList.contains('psi-sig-verdict-yes'),
-      }));
-      return {
-        url1Row: readStableRow(tables[0]),
-        url2Row: readStableRow(tables[1]),
-        significance: sig,
-      };
-    });
-
-    return parseDeepPsiOutput(raw, { originalUrl, previewUrl, label });
-  } finally {
-    await browser.close();
-  }
-}
-
-// Pure function over Deep-PSI's scraped DOM data. Separated so it can be unit
-// tested with fixture objects when the tool's markup shifts. Throws on
-// structural surprises — the loop escalates rather than guess.
-function parseDeepPsiOutput(raw, { originalUrl, previewUrl, label }) {
-  const { url1Row, url2Row, significance } = raw;
-  if (!url1Row || !url2Row) {
-    throw new Error('DEEP_PSI_EXTRACTION_FAILED: missing results table');
-  }
-  if (url1Row.length < DEEP_PSI_METRICS.length || url2Row.length < DEEP_PSI_METRICS.length) {
-    throw new Error(`DEEP_PSI_EXTRACTION_FAILED: unexpected column count (got ${url1Row.length}/${url2Row.length})`);
-  }
-
-  // Each table cell looks like "1.126 (1.165 ± 0.222)"; the leading number is
-  // the stable value Deep-PSI recommends using for comparison. Fall back to
-  // the parenthesized average if the stable value is missing.
-  const parseStable = (cell) => {
-    const leading = parseFloat(cell);
-    if (!Number.isNaN(leading)) return leading;
-    const m = cell.match(/\(\s*([\d.]+)/);
-    return m ? parseFloat(m[1]) : NaN;
-  };
-
-  const sigByMetric = new Map(significance.map((s) => [s.metric, s]));
-
-  const metrics = {};
-  for (let i = 0; i < DEEP_PSI_METRICS.length; i++) {
-    const m = DEEP_PSI_METRICS[i];
-    const original = parseStable(url1Row[i]);
-    const preview = parseStable(url2Row[i]);
-    const sig = sigByMetric.get(m);
-
-    let verdict;
-    if (!sig) {
-      // Score has no significance row in Deep-PSI's output; treat it as flat
-      // unless the reviewer wants it factored in later.
-      verdict = 'flat';
-    } else if (!sig.significant) {
-      verdict = 'flat';
-    } else {
-      const lowerBetter = LOWER_IS_BETTER.has(m);
-      const previewBetter = lowerBetter ? preview < original : preview > original;
-      verdict = previewBetter ? 'improved' : 'regressed';
-    }
-
-    metrics[m.toLowerCase()] = {
-      original,
-      preview,
-      pValue: sig ? parseFloat((sig.pText ?? '').replace(/[^\d.e+-]/gi, '')) : null,
-      significant: sig?.significant ?? false,
-      verdict,
-    };
-  }
-
-  const coreKeys = DEEP_PSI_CORE.map((m) => m.toLowerCase());
-  const overallImproved = coreKeys.some((k) => metrics[k].verdict === 'improved')
-    && !coreKeys.some((k) => metrics[k].verdict === 'regressed');
-  const hasRegressions = coreKeys.some((k) => metrics[k].verdict === 'regressed');
-
-  return {
-    label,
-    originalUrl,
-    previewUrl,
-    timestamp: Date.now(),
-    source: 'deep-psi-comparison',
-    metrics,
-    overallImproved,
-    hasRegressions,
-  };
+  // 1. Launch headless Chromium (Playwright, installed on demand)
+  // 2. Navigate to tools.aem.live/tools/deep-psi/deep-psi.html
+  // 3. Fill #url1 (original), #url2 (preview); click Submit
+  // 4. Wait for #significancetestresults li to appear (up to 10 min)
+  // 5. Scrape stable-avg row per URL + significance list via DOM query
+  // 6. return parseDeepPsiOutput(raw, { originalUrl, previewUrl, label });
 }
 ```
 
-> **Units:** Deep-PSI reports time metrics (FCP, SI, LCP, TTI, TBT) in **seconds**, CLS as a unitless ratio, and Score as a 0–100 integer. `original` / `preview` in the output above carry those raw values — downstream code that renders deltas should annotate units when presenting to humans.
+**Implementation:** See [`references/deep-psi-integration.md`](../references/deep-psi-integration.md) for the full `ensurePlaywright`, `compareWithDeepPsi`, `parseDeepPsiOutput`, the validated selectors (`#url1`, `#url2`, `#significancetestresults li`), the `DEEP_PSI_METRICS` / `DEEP_PSI_CORE` / `LOWER_IS_BETTER` constants, the output shape, and failure modes.
 
-> **Why not fall back to a different tool on failure?** A fallback that measures differently (PSI API averaging, single Lighthouse run, etc.) silently changes the measurement system mid-loop and produces incomparable numbers. If Deep-PSI fails, the loop escalates via the `DEEP_PSI_TIMEOUT` / `DEEP_PSI_EXTRACTION_FAILED` handlers in [Error Handling](#error-handling) — retry first, then human review.
+> **Units:** Deep-PSI reports time metrics (FCP, SI, LCP, TTI, TBT) in **seconds**, CLS as a unitless ratio, and Score as a 0–100 integer. Downstream code that renders deltas should annotate units when presenting to humans.
+
+> **Why no fallback measurement system?** A fallback that measures differently silently changes the measurement system mid-loop and produces incomparable numbers. If Deep-PSI fails, the loop escalates via the handlers in [Error Handling](#error-handling) — retry first, then human review.
 
 ### Step 4.3: Use Deep-PSI's Verdict Directly
 
@@ -620,129 +484,33 @@ function evaluateIteration(comparison, regressionReport, iteration) {
 
 ### Step 6.2: Optimization Strategies
 
-When performance hasn't improved, try these adjustments:
+When the decision is `PARTIAL` (no regressions, but Deep-PSI didn't call improvement significant), `applyOptimizationStrategy` runs one strategy from a rotating list. Each strategy is idempotent — running it twice is a no-op — so the loop is safe under restart.
 
-```javascript
-const fs = require('fs');
-const path = require('path');
+Current strategies:
 
-// Each strategy mutates project files and returns { changed, file? }.
-// Strategies are idempotent: the condition checks inside guarantee that
-// running the same strategy twice is a no-op.
-const OPTIMIZATION_STRATEGIES = [
-  {
-    name: 'defer_non_critical_tags',
-    description: 'Switch delayed.js from setTimeout(3000) to requestIdleCallback',
-    apply: async (repoPath) => {
-      const file = path.join(repoPath, 'scripts/delayed.js');
-      const src = fs.readFileSync(file, 'utf8');
-      if (src.includes('requestIdleCallback')) return { changed: false };
-      const next = src.replace(
-        /setTimeout\(\s*([A-Za-z_$][\w$]*)\s*,\s*3000\s*\)/,
-        `('requestIdleCallback' in window ? requestIdleCallback($1, { timeout: 5000 }) : setTimeout($1, 3000))`,
-      );
-      if (next === src) return { changed: false };
-      fs.writeFileSync(file, next);
-      return { changed: true, file: 'scripts/delayed.js' };
-    },
-  },
-  {
-    name: 'add_preconnects',
-    description: 'Add preconnect hints to head.html for the top third-party domains by call volume',
-    // Skipped if no network calls were captured in the current iteration.
-    condition: (ctx) => ctx.networkCalls?.length > 0,
-    apply: async (repoPath, { networkCalls }) => {
-      // Rank domains by call count — preconnecting the busiest ones gives the
-      // biggest DNS/TLS savings for the delayed phase.
-      const counts = networkCalls.reduce((acc, c) => {
-        const host = new URL(c.url).hostname;
-        acc.set(host, (acc.get(host) ?? 0) + 1);
-        return acc;
-      }, new Map());
-      const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+| Name | What it does |
+|---|---|
+| `defer_non_critical_tags` | Switches `scripts/delayed.js` from `setTimeout(fn, 3000)` to `requestIdleCallback(fn, { timeout: 5000 })` (with a `setTimeout` fallback for Safari) |
+| `add_preconnects` | Ranks observed third-party domains by call count and adds up to 5 `<link rel="preconnect">` entries to `head.html` |
 
-      const file = path.join(repoPath, 'head.html');
-      const src = fs.readFileSync(file, 'utf8');
-      const tags = top
-        .filter(([host]) => !src.includes(`href="https://${host}"`))
-        .map(([host]) => `<link rel="preconnect" href="https://${host}" crossorigin>`);
-      if (tags.length === 0) return { changed: false };
-      fs.writeFileSync(file, `${src}\n${tags.join('\n')}\n`);
-      return { changed: true, file: 'head.html', added: tags.length };
-    },
-  },
-];
-```
-
-> Additional strategies (`lazy_load_alloy`, `reduce_data_layer_payload`) require project-specific markers or data-layer schema we don't yet emit consistently. They're deferred until the aem-martech template adds stable anchors — tracking under **Open Questions & Risks**.
+**Implementation:** See [`references/optimization-strategies.md`](../references/optimization-strategies.md) for the full `OPTIMIZATION_STRATEGIES` array, the strategy contract (`name`, `description`, `condition`, `apply`), idempotency rules, deferred strategies (`lazy_load_alloy`, `reduce_data_layer_payload`), and guidance for adding new ones.
 
 ### Step 6.3: Regression Fixes
 
-When regressions are detected:
+When a regression is detected (a baseline network call is missing post-migration), `fixRegressions` returns **diagnostic findings only** — it does not auto-patch. A missing call almost always means the extracted instrumentation is broken, and auto-rewriting on top of a broken baseline risks compounding the problem.
 
-```javascript
-const fsp = require('fs/promises');
+The findings are attached to the iteration record as `record.diagnostics` and surfaced to the human reviewer. Any failing regression criterion triggers another iteration, then escalates.
 
-// Returns a list of human-readable findings per missing call. We don't
-// auto-mutate on regression — regressions almost always signal an error in the
-// extracted instrumentation, and the safer default is to surface the diagnosis
-// and escalate. Auto-patching regressions risks making the problem worse.
-async function fixRegressions(repoPath, regressionReport) {
-  const findings = [];
-  for (const missing of regressionReport.critical) {
-    findings.push(await diagnoseMissingCall(repoPath, missing));
-  }
-  return findings;
-}
+Per-category diagnoses (checks the loop performs against `scripts/scripts.js` and `scripts/delayed.js`):
 
-async function diagnoseMissingCall(repoPath, missing) {
-  const read = async (rel) => {
-    try { return await fsp.readFile(path.join(repoPath, rel), 'utf8'); }
-    catch { return null; }
-  };
-  const host = new URL(missing.url).hostname;
-  const scripts = await read('scripts/scripts.js') ?? '';
-  const delayed = await read('scripts/delayed.js') ?? '';
+| Category | What it checks |
+|---|---|
+| `analytics` | Is `datastreamId` present? Is `sendEvent` / `pageView` called? |
+| `personalization` | Does `loadEager` contain `alloy`? |
+| `consent` | Is a known consent tool referenced (OneTrust / Optanon / cookielaw)? |
+| default | Is the original container URL still loaded in `delayed.js`? |
 
-  switch (missing.category) {
-    case 'analytics':
-      // Analytics payload requires both a configured datastream AND a populated
-      // data layer before sendEvent fires. Either missing → no beacon.
-      return {
-        url: missing.url,
-        category: 'analytics',
-        hasDatastreamConfig: /datastreamId|datastream_id/.test(scripts),
-        hasSendEvent: /sendEvent|pageView/.test(scripts),
-        recommendation: 'Verify datastream ID is set and sendEvent is called in loadLazy after the data layer is populated.',
-      };
-    case 'personalization':
-      return {
-        url: missing.url,
-        category: 'personalization',
-        alloyInEager: /loadEager[\s\S]*?alloy/.test(scripts),
-        recommendation: 'Ensure alloy is configured and awaited inside loadEager before first section renders.',
-      };
-    case 'consent':
-      return {
-        url: missing.url,
-        category: 'consent',
-        consentScriptReferenced: /OneTrust|Optanon|cookielaw/i.test(scripts + delayed),
-        recommendation: 'Confirm the consent script is loaded early (before loadDelayed) and its callback fires.',
-      };
-    default:
-      // Generic third-party tags should still come from the container loaded
-      // in delayed.js — check that the original container URL is intact.
-      return {
-        url: missing.url,
-        category: missing.category,
-        containerStillLoaded: delayed.includes(host) || /loadScript.*adobedtm|googletagmanager/.test(delayed),
-        recommendation: 'Confirm the original container URL is loaded in delayed.js and the tag is still present in the container.',
-      };
-  }
-}
-```
-
-> The diagnostic output is returned to the loop and attached to the iteration record so the human reviewer can act on it. We deliberately avoid auto-rewriting code on regression — see Success Criteria: any failing criterion triggers another iteration, then escalates.
+**Implementation:** See [`references/regression-diagnostics.md`](../references/regression-diagnostics.md) for the full `fixRegressions`, `diagnoseMissingCall`, the finding shape, and guidance for extending to new categories.
 
 ---
 
