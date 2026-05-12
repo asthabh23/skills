@@ -245,28 +245,35 @@ For every extraction:
 ### Step 3.2: Apply Changes to Codebase
 
 ```javascript
-async function applyInstrumentation(repoPath, migrationPlan) {
+async function applyInstrumentation(repoPath, migrationPlan, iteration) {
   // 1. Modify scripts/scripts.js
   await modifyScriptsJS(repoPath, migrationPlan.scriptsChanges);
-  
+
   // 2. Modify scripts/delayed.js
   await modifyDelayedJS(repoPath, migrationPlan.delayedChanges);
-  
+
   // 3. Add head.html preconnects
   await modifyHeadHTML(repoPath, migrationPlan.preconnects);
-  
+
   // 4. Add martech plugin files if needed
   if (migrationPlan.requiresPlugin) {
     await copyPluginFiles(repoPath, migrationPlan.pluginType);
   }
-  
+
   // 5. Run lint
   await runLint(repoPath);
-  
-  // 6. Commit changes
-  await gitCommit(repoPath, 'Apply martech instrumentation (iteration ${iteration})');
+
+  // 6. Commit — iteration 1 creates the single commit the final PR will
+  // carry; subsequent iterations amend it so the branch stays at one
+  // commit no matter how many tuning passes run. Phase 4 force-pushes
+  // when amended=true.
+  const amended = iteration > 1;
+  await gitCommit(repoPath, 'Apply martech instrumentation', { amend: amended });
+  return { amended };
 }
 ```
+
+> **Why amend instead of stacking commits?** Each iteration layers optimizations on the same migration — there's no reviewer value in seeing "iter 1: apply martech", "iter 2: defer non-critical tags", "iter 3: add preconnects" as separate commits. The final PR should have one commit describing the migration; amend keeps it that way without a squash step in Phase 7. The preview URL is branch-scoped, so force-pushing the amended commit still triggers AEM Code Sync and Deep-PSI measures the right state.
 
 ---
 
@@ -630,14 +637,16 @@ async function runOptimizationLoop(config) {
 
     // Phase 3 — apply instrumentation. On iteration 1 this is the full
     // migration; later iterations layer on optimizations from the previous
-    // iteration's result.
+    // iteration's result. applyInstrumentation amends the existing commit
+    // from iteration 2 onward so the branch stays at one clean commit.
     const plan = generateMigrationPlan(strategy, containerAnalysis, i);
-    await applyInstrumentation(config.target.repo_path, plan);
+    const { amended } = await applyInstrumentation(config.target.repo_path, plan, i);
 
-    // Phase 4 — deploy, then run Deep-PSI comparison: original vs preview,
-    // measured together in one session so both sides share the same pass
-    // count, cache state, and cache-busting logic.
-    await deployToPreview(config.target);
+    // Phase 4 — deploy (force-push-with-lease when the commit was amended),
+    // then run Deep-PSI comparison: original vs preview, measured together
+    // in one session so both sides share the same pass count, cache state,
+    // and cache-busting logic.
+    await deployToPreview(config.target, { amended });
     const comparison = await compareWithDeepPsi(
       baseline.originalUrl,
       config.target.preview_url,
@@ -760,11 +769,14 @@ async function applyOptimizationStrategy(repoPath, iteration, context) {
 
 // Pushes to the configured preview branch and waits for AEM Code Sync. The
 // branch is read from config so multi-branch workflows (e.g., parallel
-// experiments) don't collide on a hardcoded name.
-async function deployToPreview(target) {
+// experiments) don't collide on a hardcoded name. When Phase 3 amended the
+// previous iteration's commit, force-push with lease so we rewrite the remote
+// branch atomically without clobbering unexpected remote work.
+async function deployToPreview(target, { amended = false } = {}) {
   const { execSync } = require('child_process');
   const branch = target.branch ?? 'martech-migration';
-  execSync(`git push origin ${branch}`, { cwd: target.repo_path, stdio: 'inherit' });
+  const pushArgs = amended ? `--force-with-lease ${branch}` : `${branch}`;
+  execSync(`git push origin ${pushArgs}`, { cwd: target.repo_path, stdio: 'inherit' });
   // AEM Code Sync webhook latency is usually <30s; give it a fixed pause
   // before measurement to avoid racing the preview URL.
   await new Promise((resolve) => setTimeout(resolve, 30000));
@@ -1065,13 +1077,9 @@ This reduces the need for manual alloy.js wiring but still requires:
 
 ## Open Questions & Risks
 
-| Risk | Mitigation |
-|------|------------|
-| **Data layer mapping complexity** — Highly customized data layers may not map correctly | Flag unmapped fields for human review; provide mapping suggestions based on field names |
-| **Container access permissions** — API access may not be available | Fallback to source code analysis; extract container URL and analyze loaded scripts |
-| **Ambiguous tag identification** — Custom-named tags don't follow conventions | Use heuristics + LLM reasoning; flag low-confidence classifications |
-| **Hybrid GTM + Launch scenarios** — Adds complexity | Support dual martech pattern; clearly document which container handles what |
-| **Cookie consent interaction** — Extracting tags breaks consent gating | Re-implement consent checks in EDS code; test with consent denied |
-| **LLM cost/latency on large containers** — Path A Stage 3 sends formatted slices to an LLM; a 500 KB bundle with many anchors could trigger many calls | Bound by `MAX_LLM_SLICES=10` and ±4 KB slice windows around near-miss anchors (never the full bundle); regex-matched vendors are excluded from the prompt so the LLM only reasons about residual code |
-| **Noisy iteration history on the feature branch** — Phase 3 runs `git commit` inside the loop, so each iteration adds a commit to the `martech-migration` branch (up to `max_iterations`, default 5). If Phase 7 opens a PR from that branch later, reviewers see the churn ("iter 1: apply martech", "iter 2: defer non-critical tags", "iter 3: add preconnects", …) instead of one clean commit | Before Phase 7 generates the review package, squash the iteration commits on the branch into a single commit (or have Phase 3 `git commit --amend --no-edit` after iteration 1). The preview URL still updates on each push since it's branch-scoped, not commit-scoped, so squash/amend doesn't break the Deep-PSI measurement flow |
+This table is for **inherent trade-offs** that will remain true even when the skill is fully built out — not a TODO list. Items that were open questions at design time and are now wired into the code have been removed (see git history).
+
+| Risk | Runtime behavior |
+|------|------------------|
+| **Data layer mapping complexity** — Highly customized data layers may not map to XDM automatically | `extractDataLayerSchema` in [`references/data-layer-mapping.md`](../references/data-layer-mapping.md) surfaces low-confidence fields as `manual_review_items`. Some customers will always need human mapping; this is not something the loop will eliminate. |
 
