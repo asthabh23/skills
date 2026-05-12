@@ -552,7 +552,9 @@ function generateReviewPackage(iterations) {
 
     testUrls: {
       preview: 'https://martech-migration--repo--org.aem.page/',
-      deepPsi: 'https://tools.aem.live/tools/deep-psi/deep-psi.html',
+      // Pre-filled with the same URLs the loop used so the reviewer can
+      // reproduce the comparison with one click instead of re-typing both.
+      deepPsi: `https://tools.aem.live/tools/deep-psi/deep-psi.html?url1=${encodeURIComponent(last.comparison.originalUrl)}&url2=${encodeURIComponent(last.comparison.previewUrl)}`,
     },
 
     manualChecks: [
