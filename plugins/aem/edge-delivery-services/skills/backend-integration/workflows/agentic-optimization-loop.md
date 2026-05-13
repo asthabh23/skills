@@ -138,7 +138,33 @@ const baseline = { originalUrl: config.source.site_url };
 
 ## Phase 1: Container Analysis
 
-Container analysis has two paths depending on available access. Use the API path when credentials are available; otherwise fall back to source code analysis.
+Container analysis has three paths. Use the supplied report when one is provided; the API path when credentials are available; otherwise fall back to source code analysis.
+
+### Path 0: Use a Supplied Detection Report (When `container_analysis` Is Set)
+
+If the workflow config provides `container_analysis.vendors[]`, skip detection entirely. Validate the shape (each entry has `vendor`, `category`, `phase`) and pass the list straight through to Phase 2. This lets external audit tools, prior loop runs, or hand-curated reports drive the migration without re-discovering vendors.
+
+```javascript
+function loadSuppliedAnalysis(supplied) {
+  // Validate required fields per entry; missing category/phase falls back to
+  // detection rather than guessing — better to fail loudly than ship a wrong
+  // extraction boundary.
+  for (const v of supplied.vendors ?? []) {
+    if (!v.vendor || !v.category || !v.phase) {
+      throw new Error(`SUPPLIED_ANALYSIS_INVALID: ${JSON.stringify(v)} missing vendor/category/phase`);
+    }
+  }
+  return {
+    vendors: supplied.vendors,
+    hasPersonalization: supplied.vendors.some((v) => v.category === 'personalization'),
+    hasAnalytics: supplied.vendors.some((v) => v.category.startsWith('analytics')),
+    confidence: 'high',
+    source: 'supplied',
+  };
+}
+```
+
+> Not every input will know `category` and `phase` for every vendor. If an entry has only `vendor`, the loop runs **classification-only** — looking the vendor up in the same `VENDOR_SIGNATURES` map Path A uses, no regex scan or LLM call. This avoids re-detecting what's already known while still filling in gaps. Implementation lives in [`references/source-code-analysis.md`](../references/source-code-analysis.md) under "Classification Lookup".
 
 ### Path A: Source Code Analysis (Always Available)
 
@@ -693,8 +719,16 @@ async function runOptimizationLoop(config) {
 The loop orchestration above calls five functions that are defined here.
 
 ```javascript
-// Unify GTM and Launch analysis behind a single interface
+// Unify supplied report, GTM API, Launch API, and source-code analysis behind
+// a single interface. Order matters: a supplied report wins, then API access,
+// then source fallback. This keeps detection cost (LLM calls, API quota) zero
+// when the answer is already known.
 async function analyzeContainer(config) {
+  // Path 0 — pre-detection supplied. No detection cost incurred.
+  if (config.container_analysis?.vendors?.length) {
+    return loadSuppliedAnalysis(config.container_analysis);
+  }
+
   const { type } = config.container;
   if (type === 'gtm') {
     const tagmanager = await authenticateGTM(config.container.gtm.api_credentials.service_account_key);
@@ -832,14 +866,47 @@ container:
     api_credentials:
       service_account_key: "${GTM_SERVICE_ACCOUNT_KEY_PATH}"
 
+# Optional: skip Phase 1 detection by supplying a pre-built vendor list.
+# Useful when an external audit tool, a prior loop run, or the user already
+# enumerated what's on the page — Phase 1 then validates the shape and routes
+# straight to Phase 2. Same output shape as analyzeFromSource() in
+# references/source-code-analysis.md.
+container_analysis:
+  vendors:
+    - { vendor: "adobe-websdk-alloy", category: "personalization",   phase: "eager",   confidence: "high", source: "user" }
+    - { vendor: "ga4",                category: "analytics_pageview", phase: "lazy",    confidence: "high", source: "user" }
+    - { vendor: "microsoft-clarity",  category: "analytics_events",   phase: "delayed", confidence: "high", source: "user" }
+    # ... one entry per vendor on the page
+
 target:
   repo_path: "/path/to/eds-project"
   preview_url: "https://main--repo--org.aem.page/"
   
 adobe_stack:
-  datastream_id: "${DATASTREAM_ID}"
+  # Adobe AEP exposes one datastream per environment. The generated scripts.js
+  # picks the right one at runtime based on hostname (preview → dev,
+  # staging branch → stage, prod hostname → prod). Single-env customers can
+  # set all three to the same value; unset entries flag as manual_review_items.
+  datastream_ids:
+    dev: "${DATASTREAM_ID_DEV}"
+    stage: "${DATASTREAM_ID_STAGE}"
+    prod: "${DATASTREAM_ID_PROD}"
   analytics_rsid: "${ANALYTICS_RSID}"
   target_property_token: "${TARGET_PROPERTY_TOKEN}"
+
+  # Page-level personalization gate. Defaults to 'always' to preserve the
+  # current behavior (alloy decisioning fires on every page). Set to
+  # 'metadata' for sites where only some pages are personalized — the eager
+  # alloy call is then conditional on the page authoring the configured meta
+  # tag. Set to 'never' to ship the wiring without any personalization fetch.
+  personalization_default: "always"  # 'always' | 'metadata' | 'never'
+  personalization_signal: "target"   # meta name checked when default = 'metadata'
+
+  # Regulatory posture for consent. 'opt-in' (GDPR) blocks martech until
+  # consent is given; 'opt-out' (CCPA) fires by default and honors later
+  # opt-out signals; 'opt-in-eu-only' branches at runtime by detected region.
+  # See [`references/consent-gated-architecture.md`](../references/consent-gated-architecture.md) for generated patterns.
+  consent_model: "opt-in"  # 'opt-in' | 'opt-out' | 'opt-in-eu-only'
 
 optimization:
   max_iterations: 5
@@ -951,10 +1018,13 @@ required:
 optional:
   - site_url: Live URL of the current site (for network call baseline)
   - ims_org_id: Customer's IMS Org ID (for Adobe stack)
-  - datastream_id: Customer's AEP Datastream ID
+  - datastream_ids: { dev, stage, prod } map of AEP Datastream IDs per environment
   - analytics_rsid: Adobe Analytics Report Suite ID
   - ga_measurement_id: Google Analytics Measurement ID
   - target_property_token: Target property token if applicable
+  - personalization_default: 'always' | 'metadata' | 'never' (default 'always')
+  - personalization_signal: meta name when personalization_default = 'metadata' (default 'target')
+  - consent_model: 'opt-in' | 'opt-out' | 'opt-in-eu-only' (default 'opt-in')
 ```
 
 ### Output Schema
@@ -1084,4 +1154,5 @@ This table is for **inherent trade-offs** that will remain true even when the sk
 | Risk | Runtime behavior |
 |------|------------------|
 | **Data layer mapping complexity** — Highly customized data layers may not map to XDM automatically | `extractDataLayerSchema` in [`references/data-layer-mapping.md`](../references/data-layer-mapping.md) surfaces low-confidence fields as `manual_review_items`. Some customers will always need human mapping; this is not something the loop will eliminate. |
+| **Region-aware consent posture** — A US-only customer under CCPA wants opt-out by default; an EU customer under GDPR wants opt-in; a global customer wants `opt-in-eu-only` (branch on detected region). The loop can't infer the right model from the source site — it's a customer policy decision, not a technical signal. Real-world precedent: petplace.com skips its consent banner entirely for US visitors and grants all categories by default. | Driven by `adobe_stack.consent_model` config: `opt-in` (default; safe under GDPR), `opt-out` (CCPA-style), or `opt-in-eu-only` (geo-branched). The aem-martech template generates the matching `defaultConsent` value and the consent fanout handler reads the same flag to decide whether to grant by default. Document the choice in the customer's compliance record; the loop won't second-guess it. |
 

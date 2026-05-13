@@ -244,3 +244,31 @@ Array of findings matching the schema above. The orchestrator tags each with `so
 | Prettier parse error on a slice | Caught; raw slice is classified instead |
 | LLM returns malformed JSON | Orchestrator logs, skips that slice, continues with remaining slices |
 | `MAX_LLM_SLICES` exceeded | Earlier slices win (anchors are scanned in source order); record warning in output |
+
+---
+
+## Classification Lookup (For Path 0 Pre-Detection Reports)
+
+When the workflow's `container_analysis` is supplied with vendor names but missing `category` or `phase` for some entries, this helper enriches them by name without re-running detection.
+
+```javascript
+// Index VENDOR_SIGNATURES by vendor name once for O(1) classification lookup.
+const VENDORS_BY_NAME = new Map(VENDOR_SIGNATURES.map((s) => [s.vendor, s]));
+
+// Enriches a partial vendor entry from a supplied detection report. If the
+// caller already provided category/phase those win; otherwise we look them
+// up in the signatures table. Returns null when the vendor name isn't known
+// and the entry is incomplete — surfacing the gap rather than guessing.
+function classifyKnownVendor(entry) {
+  const known = VENDORS_BY_NAME.get(entry.vendor);
+  return {
+    vendor: entry.vendor,
+    category: entry.category ?? known?.category ?? null,
+    phase: entry.phase ?? known?.phase ?? null,
+    confidence: entry.confidence ?? (known ? 'high' : 'low'),
+    source: entry.source ?? 'lookup',
+  };
+}
+```
+
+The Phase 1 orchestrator's Path 0 branch (`loadSuppliedAnalysis`) calls this for any entry missing `category` or `phase`. Entries that come back with `category: null` are flagged for human review and excluded from extraction-boundary decisions in Phase 2.

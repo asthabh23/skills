@@ -224,3 +224,57 @@ When a project needs 3+ third-party integrations with consent management:
 5. Each integration becomes a simple loader function — the orchestrator handles consent
 
 Cross-reference the individual integration files (`google-tag-manager.md`, `hotjar.md`, `meta-pixel.md`, `linkedin-insight.md`, `pardot.md`, `onetrust.md`) for the specific loader function code.
+
+## Multi-Vendor Consent Fanout
+
+Use this when the loop has already extracted vendors into `loadEager` / `loadLazy`. Those vendors are loaded by the time consent changes, so they need a runtime *update*, not a load-on-consent gate.
+
+Phase 3 emits one block per entry in `containerAnalysis.vendors[]` — driven by detection (or by a supplied report), so the handler covers exactly the vendors actually on the page. Vendor-update snippets:
+
+```javascript
+function applyConsent({ collect, marketing, personalize, share }) {
+  // adobe-websdk-alloy / adobe-target / adobe-ajo
+  if (window.alloy) {
+    window.alloy('setConsent', {
+      consent: [{
+        standard: 'Adobe', version: '2.0',
+        value: {
+          collect:     { val: collect ? 'y' : 'n' },
+          marketing:   { preferences: { val: marketing ? 'y' : 'n' } },
+          personalize: { content: { val: personalize ? 'y' : 'n' } },
+          share:       { val: share ? 'y' : 'n' },
+        },
+      }],
+    });
+  }
+
+  // ga4 / ga-universal / google-ads (gtag-driven vendors)
+  if (window.gtag) {
+    window.gtag('consent', 'update', {
+      analytics_storage:  collect   ? 'granted' : 'denied',
+      ad_storage:         marketing ? 'granted' : 'denied',
+      ad_user_data:       marketing ? 'granted' : 'denied',
+      ad_personalization: marketing ? 'granted' : 'denied',
+    });
+  }
+
+  // segment — opt-out toggles its sink; mixpanel and amplitude expose similar
+  // calls if the vendor is on the page.
+  if (window.analytics?.reset && !collect) window.analytics.reset();
+  if (window.mixpanel) (collect ? window.mixpanel.opt_in_tracking : window.mixpanel.opt_out_tracking)();
+  if (window.amplitude) window.amplitude.setOptOut(!collect);
+}
+
+// Initial decision plus banner-driven updates. Event names match the
+// generated consent helpers; Adobe Target / personalization use 'consent',
+// most CMPs emit 'consent-updated'.
+applyConsent(readStoredConsent());
+window.addEventListener('consent',         (ev) => applyConsent(ev.detail.categories));
+window.addEventListener('consent-updated', (ev) => applyConsent(ev.detail.categories));
+```
+
+### What Phase 3 Generates
+
+For each `vendor` in `containerAnalysis.vendors[]`, Phase 3 emits the matching block above. Vendors not in this snippet — Microsoft Clarity, Meta Pixel, LinkedIn Insight, Hotjar, Heap, Contentsquare — are flagged in `manual_review_items` so the reviewer adds the vendor-specific call. The fanout shape is generic; the per-vendor APIs are not.
+
+> Use this **alongside** the load-on-consent pattern above, not instead of it. Vendors extracted to eager/lazy use fanout (already loaded → update at runtime); vendors that stay in delayed use load-on-consent (gate before loading).

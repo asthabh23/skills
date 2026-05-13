@@ -47,46 +47,80 @@ import { sampleRUM, loadHeader, loadFooter, decorateButtons, decorateIcons,
 // ============================================================
 // SETUP: Configure the values below before deploying to production.
 //
-// datastreamId: AEP → Data Collection → Datastreams → your stream → copy ID
+// datastreamIds: AEP → Data Collection → Datastreams → one stream per env
 // orgId: Adobe Admin Console → Settings → Organization ID (format: XXXXX@AdobeOrg)
 // launchUrls: AEP → Data Collection → Tags → Environments → Install URLs
 // ============================================================
 
 const MARTECH_CONFIG = {
-  // Core identifiers — REQUIRED
-  datastreamId: '', // ← AEP Datastream ID
-  orgId: '',        // ← IMS Org ID (XXXXX@AdobeOrg)
+  orgId: '', // ← IMS Org ID (XXXXX@AdobeOrg)
+
+  // One datastream per environment so preview traffic doesn't pollute prod
+  // analytics. Single-env customers can set all three to the same value.
+  datastreamIds: {
+    dev: '',   // ← Dev datastream ID
+    stage: '', // ← Stage datastream ID
+    prod: '',  // ← Prod datastream ID
+  },
 
   // Launch container URLs by environment
   launchUrls: {
-    dev: '',        // ← Development container URL
-    stage: '',      // ← Staging container URL  
-    prod: '',       // ← Production container URL
+    dev: '',
+    stage: '',
+    prod: '',
   },
 
   // Data layer instance name — must match Launch ACDL extension setting
   dataLayerInstanceName: 'adobeDataLayer',
 
-  // Consent default — DO NOT change to 'in' without legal review
+  // Consent default — DO NOT change to 'in' without legal review.
   // 'pending' = wait for consent signal before tracking
-  // 'in' = assume consent (only for regions without consent requirements)
+  // 'in' = assume consent (only for regions without consent requirements;
+  //        use consent_model: 'opt-out' in the workflow config for those)
   defaultConsent: 'pending',
 
-  // Page metadata key that enables personalization
-  // Set 'Target: on' in page metadata to enable propositions
-  targetMetadataKey: 'target',
+  // Personalization gate. 'always' = fire alloy decisioning on every page
+  // (current default behavior); 'metadata' = only fire when the page authors
+  // <meta name="target" content="on">; 'never' = ship the wiring without
+  // personalization. Driven by adobe_stack.personalization_default in the
+  // workflow config.
+  personalizationDefault: 'always', // 'always' | 'metadata' | 'never'
+  targetMetadataKey: 'target',      // meta name used when personalizationDefault = 'metadata'
 
-  // Environment detection
+  // Hostname-based environment detection. Adjust the dev/stage patterns to
+  // match your project's preview URL convention (the loop's deployToPreview
+  // pushes to <branch>--<repo>--<org>.aem.page).
   getEnvironment: () => {
     const { hostname } = window.location;
     if (hostname.includes('localhost') || hostname.includes('.aem.page')) return 'dev';
-    if (hostname.includes('.aem.live')) return 'stage';
+    if (hostname.startsWith('staging--') || hostname.includes('.aem.live')) return 'stage';
     return 'prod';
+  },
+
+  // Resolve the datastream ID for the current environment. Falls back through
+  // prod → stage → dev so a partial config still works on production.
+  getDatastreamId() {
+    const env = this.getEnvironment();
+    return this.datastreamIds[env]
+      || this.datastreamIds.prod
+      || this.datastreamIds.stage
+      || this.datastreamIds.dev;
+  },
+
+  // Per-page personalization decision. Returns true when alloy should fetch
+  // propositions in the eager phase. Cheap to call; safe to invoke before
+  // initMartech().
+  shouldPersonalize() {
+    if (this.personalizationDefault === 'never') return false;
+    if (this.personalizationDefault === 'always') return true;
+    // 'metadata' — only fire if the page opted in.
+    return !!getMetadata(this.targetMetadataKey);
   },
 };
 
-// Skip martech entirely on preview/dev if not configured
-const SKIP_MARTECH = !MARTECH_CONFIG.datastreamId || !MARTECH_CONFIG.orgId;
+// Skip martech entirely if any required identifier is missing for the
+// current environment.
+const SKIP_MARTECH = !MARTECH_CONFIG.getDatastreamId() || !MARTECH_CONFIG.orgId;
 
 // ============================================================
 // Plugin Import and Initialization
@@ -144,14 +178,18 @@ async function loadEager(doc) {
       martechPlugin = await initMartech();
       if (martechPlugin) {
         await martechPlugin.configure({
-          datastreamId: MARTECH_CONFIG.datastreamId,
+          // Hostname-resolved so dev/stage/prod each hit the right datastream
+          datastreamId: MARTECH_CONFIG.getDatastreamId(),
           orgId: MARTECH_CONFIG.orgId,
           defaultConsent: MARTECH_CONFIG.defaultConsent,
           dataLayerInstanceName: MARTECH_CONFIG.dataLayerInstanceName,
         });
 
-        // Only fetch propositions if page has Target metadata enabled
-        if (getMetadata(MARTECH_CONFIG.targetMetadataKey)) {
+        // Per-page personalization gate. Honors personalizationDefault:
+        //   'always'   → fetch on every page (alloy decisioning round-trip)
+        //   'metadata' → fetch only when the page authored the meta opt-in
+        //   'never'    → skip the fetch entirely
+        if (MARTECH_CONFIG.shouldPersonalize()) {
           await martechPlugin.fetchPropositions();
         }
       }
