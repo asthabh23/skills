@@ -10,6 +10,43 @@ Stage order (recap):
 
 ---
 
+## Source Site EDS Preflight (Phase 0)
+
+Runs before any other analysis. If the source site is already on EDS, the loop has nothing to migrate — abort with guidance rather than producing a less-sophisticated copy of what's already deployed.
+
+```javascript
+// EDS sites import their boilerplate from one of two filenames (aem.js is
+// the current standard; lib-franklin.js predates the rename and is still in
+// use on older projects). Path conventions vary — most use /scripts/ but
+// some sites (e.g., marutisuzuki.com) use /commons/scripts/. The HTML scan
+// catches non-standard paths since every EDS page imports one of those two
+// filenames somewhere in a <script> tag.
+async function detectExistingEdsSite(siteUrl) {
+  const candidatePaths = [
+    '/scripts/aem.js',
+    '/scripts/lib-franklin.js',
+    '/commons/scripts/aem.js',
+    '/commons/scripts/lib-franklin.js',
+  ];
+  for (const path of candidatePaths) {
+    const res = await fetch(new URL(path, siteUrl).href, { method: 'HEAD' });
+    if (res.ok) return { isEds: true, evidence: `boilerplate at ${path}` };
+  }
+
+  // Fallback: scan the rendered HTML for an aem.js / lib-franklin.js import
+  // at any path. Skips the candidate-path probes' assumption about location.
+  const html = await fetch(siteUrl).then((r) => r.text());
+  const m = html.match(/<script[^>]+src="([^"]+(?:aem|lib-franklin)\.js)"/i);
+  if (m) return { isEds: true, evidence: `imports ${m[1]}` };
+
+  return { isEds: false };
+}
+```
+
+The Phase 0 caller throws `SOURCE_ALREADY_EDS` when `isEds: true`. Migration of an already-migrated site silently produces wrong-but-plausible output; abort is safer than continuing.
+
+---
+
 ## Vendor Signatures
 
 Deliberately conservative — false positives here mislead Phase 2 strategy selection. Each entry carries the regex, the martech category, and the phase where the vendor typically belongs post-migration.

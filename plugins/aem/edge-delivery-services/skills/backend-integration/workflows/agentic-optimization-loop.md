@@ -111,6 +111,26 @@ When API access is available, the agent can read the container programmatically 
 
 Before any changes, capture the baseline state.
 
+### Step 0.0: Source Site EDS Preflight
+
+Probe the source site for EDS boilerplate (`aem.js` or `lib-franklin.js`, in `/scripts/` or `/commons/scripts/`, or anywhere in the page's `<script>` imports). If the source is already on EDS, **abort the loop** — there's nothing to migrate, and producing a "migration" would silently generate a less-sophisticated version of the existing setup.
+
+```javascript
+const eds = await detectExistingEdsSite(config.source.site_url);
+if (eds.isEds) {
+  throw new Error(
+    `SOURCE_ALREADY_EDS: ${config.source.site_url} is already on Edge Delivery `
+    + `(${eds.evidence}). The loop migrates legacy sites to EDS — there's nothing `
+    + `to migrate here. To replicate this site's setup into a fresh repo, the user `
+    + `should run a "clone existing EDS setup" flow instead (out of scope for this loop).`,
+  );
+}
+```
+
+**Implementation:** See [`references/source-code-analysis.md`](../references/source-code-analysis.md#source-site-eds-preflight-phase-0) for `detectExistingEdsSite` (path probes + HTML import scan covering both boilerplate filenames and both common path conventions).
+
+> **Why this matters:** sites being audited for migration may already have been migrated by a prior project, or by a different team. Both `petplace.com` and `marutisuzuki.com` are real examples that would have looked like legacy migration candidates from network signals alone (heavy Adobe Launch + alloy + Analytics) but are in fact already on EDS — `marutisuzuki.com` uses non-standard `/commons/scripts/` paths that path-only probes miss; the HTML scan catches it. Without this preflight, the loop wastes Phase 1–7 producing the wrong code.
+
 ### Step 0.1: Capture Network Call Baseline
 
 Use Playwright to intercept all third-party requests on the original site, then categorize by type (analytics, personalization, consent, social, other).
