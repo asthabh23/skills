@@ -59,7 +59,21 @@ async function analyzeFromSource(scriptsJsContent, containerUrl) {
   const containerType = detectContainerType(scriptsJsContent);
   const source = await fetch(containerUrl).then((r) => r.text());
 
-  const matches = scanSignatures(source);
+  // Stage 1: SDK-string regex (cheap, catches vendors with embedded SDK code)
+  const sdkMatches = scanSignatures(source);
+
+  // Stage 1.5: Launch-extension scan (cheap, catches vendors loaded *by* a
+  // Launch container that don't embed their SDK in the bundle). Without this,
+  // a Launch container that loads alloy/GA4/Floodlight at runtime would
+  // appear vendor-free to Stage 1, since those SDKs aren't in the bundle.
+  const extMatches = containerType === 'launch' || containerType === 'both'
+    ? scanLaunchExtensions(source)
+    : [];
+
+  // Merge and dedupe — a vendor matched by both passes (rare) is high-confidence
+  // and we keep one entry.
+  const matches = mergeVendorFindings(sdkMatches, extMatches);
+
   const residual = await triageResidual(source, matches);
   const all = [...matches, ...residual];
 
@@ -104,6 +118,96 @@ function scanSignatures(source) {
   return out;
 }
 ```
+
+---
+
+## Stage 1.5 — Launch Extension Scan
+
+Adobe Launch containers don't embed vendor SDKs — they load them at runtime via *extensions*. The bundle lists extensions by `modulePath` strings like `"facebook-pixel/src/lib/actions/firePixel.js"`. Stage 1's SDK-string regex misses these because there's no `fbq(` or `alloy` in the minified config; only the extension name.
+
+This stage scans `modulePath` roots against a curated extension-to-vendor map. Cheap (one regex pass over the source), high-confidence (extensions are explicit dependencies declared by the customer in Launch).
+
+```javascript
+// Map of Launch extension package names → vendor metadata. Each entry mirrors
+// the shape Stage 1 produces so the merge step is symmetric. Keep this list
+// curated to known Adobe-marketplace + common gcoe-* extensions; add new
+// rows as they're encountered. Unknown extensions are surfaced as confidence:
+// 'low' so they reach human review rather than being silently classified.
+const LAUNCH_EXTENSIONS = {
+  // Adobe Marketplace
+  'core':                          null, // Launch core — not a vendor
+  'adobe-analytics':               { vendor: 'adobe-analytics',     category: 'analytics_pageview', phase: 'lazy'    },
+  'adobe-target':                  { vendor: 'adobe-target',        category: 'personalization',    phase: 'eager'   },
+  'adobe-mcid':                    { vendor: 'adobe-ecid',          category: 'identity',           phase: 'head'    },
+  'adobe-audience-manager':        { vendor: 'adobe-aam',           category: 'advertising',        phase: 'delayed' },
+  'web-sdk':                       { vendor: 'adobe-websdk-alloy',  category: 'personalization',    phase: 'eager'   },
+
+  // Common third-party Launch extensions
+  'facebook-pixel':                { vendor: 'meta-pixel',          category: 'advertising',        phase: 'delayed' },
+  'doubleclick-floodlight':        { vendor: 'google-floodlight',   category: 'advertising',        phase: 'delayed' },
+  'acronym-gtag.js':               { vendor: 'ga4',                 category: 'analytics_pageview', phase: 'lazy'    },
+  'google-analytics':              { vendor: 'ga-universal',        category: 'analytics_pageview', phase: 'lazy'    },
+  'contentsquare':                 { vendor: 'contentsquare',       category: 'analytics_events',   phase: 'delayed' },
+  'hotjar':                        { vendor: 'hotjar',              category: 'analytics_events',   phase: 'delayed' },
+  'linkedin-insight-tag':          { vendor: 'linkedin-insight',    category: 'advertising',        phase: 'delayed' },
+  'tiktok-pixel':                  { vendor: 'tiktok-pixel',        category: 'advertising',        phase: 'delayed' },
+
+  // Adobe gcoe-* (Adobe Group Centre of Excellence) extensions — internal-flavored
+  // names that cover the data-layer + custom integrations Adobe customers ship.
+  'gcoe-adobe-client-data-layer':  { vendor: 'adobe-data-layer',    category: 'data-layer',         phase: 'head'    },
+};
+
+function scanLaunchExtensions(source) {
+  // Launch bundles emit modulePath strings as part of their module registry.
+  // Extract every distinct root segment — that's the extension package name.
+  const paths = [...source.matchAll(/modulePath:"([^"]+)"/g)].map((m) => m[1]);
+  const roots = [...new Set(paths.map((p) => p.split('/')[0]))];
+
+  const out = [];
+  for (const root of roots) {
+    if (!(root in LAUNCH_EXTENSIONS)) {
+      // Unknown extension — surface for human review instead of silently dropping.
+      out.push({
+        vendor: root,
+        category: 'unknown',
+        phase: 'unknown',
+        confidence: 'low',
+        source: 'launch-ext',
+      });
+      continue;
+    }
+    const entry = LAUNCH_EXTENSIONS[root];
+    if (!entry) continue; // entries mapped to null (e.g., 'core') aren't vendors
+    out.push({ ...entry, source: 'launch-ext', confidence: 'high' });
+  }
+  return out;
+}
+
+// Stage 1 (SDK regex) and Stage 1.5 (extension scan) can both find the same
+// vendor (e.g., adobe-target appears as both an at.js SDK string and an
+// adobe-target extension). De-dupe on vendor name, keeping the higher-confidence
+// finding. Source is preserved as a comma-joined string so downstream review
+// shows what evidence backs the finding.
+function mergeVendorFindings(...lists) {
+  const rank = { high: 3, medium: 2, low: 1 };
+  const byVendor = new Map();
+  for (const list of lists) {
+    for (const f of list) {
+      const existing = byVendor.get(f.vendor);
+      if (!existing) {
+        byVendor.set(f.vendor, { ...f });
+      } else if (rank[f.confidence] > rank[existing.confidence]) {
+        byVendor.set(f.vendor, { ...f, source: `${existing.source},${f.source}` });
+      } else {
+        existing.source = `${existing.source},${f.source}`;
+      }
+    }
+  }
+  return [...byVendor.values()];
+}
+```
+
+> **When this matters:** any Adobe Launch container without embedded SDK code — i.e., most of them. A Launch container that loads alloy + GA4 + Facebook Pixel + Contentsquare at runtime would have appeared vendor-free to Stage 1 alone (real example: the marutisuzuki.com migration audit). Stage 1.5 closes that gap with no LLM cost.
 
 ---
 

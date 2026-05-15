@@ -168,23 +168,27 @@ function loadSuppliedAnalysis(supplied) {
 
 ### Path A: Source Code Analysis (Always Available)
 
-Path A is a **three-stage pipeline**. Earlier stages are cheap and deterministic; later stages are paid but catch what earlier ones miss. This is the same pattern used across the workflow — do the free, high-confidence work first, then escalate.
+Path A is a **four-stage pipeline**. Earlier stages are cheap and deterministic; later stages are paid but catch what earlier ones miss. This is the same pattern used across the workflow — do the free, high-confidence work first, then escalate.
 
 | Stage | What | Cost | Confidence |
 |-------|------|------|------------|
-| 1. Regex scan | Match known vendor signatures (Adobe, GTM, Optimizely, VWO, Dynamic Yield, Segment, Mixpanel, Amplitude, Heap, Hotjar, Contentsquare, OneTrust, Cookiebot, …) in the raw bundle | Free | High when matched |
+| 1. SDK regex scan | Match known vendor signatures (Adobe, GTM, Optimizely, VWO, Dynamic Yield, Segment, Mixpanel, Amplitude, Heap, Hotjar, Contentsquare, OneTrust, Cookiebot, …) in the raw bundle | Free | High when matched |
+| 1.5. Launch extension scan | Adobe Launch containers don't embed vendor SDKs — they list extensions by `modulePath` strings. This stage maps extension package names (e.g., `facebook-pixel`, `acronym-gtag.js`, `web-sdk`) to vendor metadata. | Free | High when matched; unknown extensions surface as `low` for review |
 | 2. Slice + format | Extract ±4 KB character windows around *near-miss anchors* (`track`, `experiment`, `consent`, etc.) and format each slice with `prettier` | ~1 s × ≤10 slices | — |
 | 3. LLM triage | Classifier returns `{vendor, category, phase, confidence, reasoning}` per slice | Paid; capped at `MAX_LLM_SLICES=10` | Self-reported |
 
-The staged order matters: regex handles the 80% case deterministically, slicing avoids sending a 500 KB bundle to the LLM, and `MAX_LLM_SLICES` is a hard cost ceiling.
+The staged order matters: deterministic stages handle the 80% case for free; slicing avoids sending a 500 KB bundle to the LLM; `MAX_LLM_SLICES` is a hard cost ceiling. **Without Stage 1.5**, a Launch container that loads alloy + GA4 + Floodlight at runtime would appear vendor-free to Stage 1 (real failure mode caught during a real-site audit).
 
 ```javascript
 // Skeleton — full implementation in references/source-code-analysis.md.
 async function analyzeFromSource(scriptsJsContent, containerUrl) {
   const containerType = detectContainerType(scriptsJsContent);
   const source = await fetch(containerUrl).then((r) => r.text());
-  const matches = scanSignatures(source);              // Stage 1
-  const residual = await triageResidual(source, matches); // Stages 2 + 3
+  const sdkMatches = scanSignatures(source);                                       // Stage 1
+  const extMatches = containerType === 'launch' || containerType === 'both'
+    ? scanLaunchExtensions(source) : [];                                           // Stage 1.5
+  const matches = mergeVendorFindings(sdkMatches, extMatches);
+  const residual = await triageResidual(source, matches);                          // Stages 2 + 3
   const all = [...matches, ...residual];
   return {
     containerType,
