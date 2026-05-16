@@ -263,6 +263,12 @@ decision_tree:
 
   - if: Both GTM and Launch
     then: Dual martech pattern (both containers in delayed.js, consent-gated)
+
+  - if: Direct gtag.js (G-XXXXXXXXXX measurement ID and/or AW-XXXXXXXXXX Ads accounts)
+        WITHOUT a GTM container
+    then: Approach 5 — extract GA4 page view to lazy, keep Google Ads conversion pings
+          in delayed.js. No container URL exists, so no plugin is used; gtag is called
+          directly.
 ```
 
 **Output:** `migration-plan.json` — records the chosen approach, plugin type, config variables extracted, what is being extracted vs left in the container, and any items flagged for human review.
@@ -783,26 +789,40 @@ function selectStrategy(containerAnalysis) {
     || containerAnalysis.hasPersonalization;
   const hasAnalytics = containerAnalysis.analytics_pageview?.length > 0
     || containerAnalysis.hasAnalytics;
+  // "direct gtag" means GA4 / Google Ads loaded via gtag.js without a GTM container
+  // (the page references G-XXXXXXXXXX or AW-XXXXXXXXXX directly, not GTM-XXXXXXX).
+  const hasDirectGtag = containerAnalysis.directGtag === true
+    || containerAnalysis.vendors?.some?.((v) => v.vendor === 'ga4' || v.vendor === 'google-ads');
   const isGTM = containerAnalysis.type === 'gtm' || containerAnalysis.containerType === 'gtm';
   const isBoth = containerAnalysis.type === 'both' || containerAnalysis.containerType === 'both';
+  const isLaunch = containerAnalysis.type === 'launch' || containerAnalysis.containerType === 'launch';
+  const noContainer = !isGTM && !isBoth && !isLaunch;
 
   if (isBoth) return { plugin: 'dual', approach: 'dual-martech' };
   if (isGTM && !hasPersonalization) return { plugin: 'aem-gtm-martech', approach: 'gtm-only' };
   if (hasPersonalization && hasAnalytics) return { plugin: 'aem-martech', approach: 'full-adobe-stack' };
+  // Direct gtag.js without a GTM container (e.g. site loads gtag.js with measurement IDs
+  // G-XXXXXXXXXX and Ads accounts AW-XXXXXXXXXX directly). No container URL exists, so we
+  // can't use `launch-delayed-only` — instead extract GA4 page view to lazy and leave Ads
+  // conversion pings in delayed.js.
+  if (noContainer && hasDirectGtag) return { plugin: null, approach: 'direct-gtag-lazy' };
   return { plugin: null, approach: 'launch-delayed-only' };
 }
 
 // Build the per-iteration instrumentation plan
 function generateMigrationPlan(strategy, containerAnalysis, iteration) {
+  const isDirectGtag = strategy.approach === 'direct-gtag-lazy';
   return {
     iteration,
     strategy,
     // What gets extracted into EDS code (extraction boundary)
     eager: strategy.approach === 'full-adobe-stack' ? ['alloy.js init', 'Target propositions'] : [],
-    lazy: (strategy.approach === 'full-adobe-stack' || strategy.approach === 'gtm-only')
+    lazy: (strategy.approach === 'full-adobe-stack' || strategy.approach === 'gtm-only' || isDirectGtag)
       ? ['analytics page view beacon'] : [],
-    // Everything else stays in the container loaded in delayed
-    delayed: ['container URL', 'consent', 'social pixels', 'remaining tags'],
+    // For direct-gtag-lazy there is NO container URL — only Ads pings + consent live in delayed.
+    delayed: isDirectGtag
+      ? ['Google Ads conversion pings (gtag direct)', 'consent', 'social pixels', 'remaining tags']
+      : ['container URL', 'consent', 'social pixels', 'remaining tags'],
     requiresPlugin: !!strategy.plugin,
     pluginType: strategy.plugin,
     // Optimization hints for iteration > 1
@@ -1162,6 +1182,7 @@ This reduces the need for manual alloy.js wiring but still requires:
 | New implementation, WebSDK 2.34.0+ | Consider native splitting |
 | Existing container with many custom rules | Manual aem-martech plugin (more control) |
 | GTM (Google stack) | aem-gtm-martech plugin (native splitting N/A) |
+| Direct gtag.js (GA4 + Ads, no GTM container) | `direct-gtag-lazy` — GA4 page view to lazy, Ads conversion pings in delayed.js. No plugin |
 
 ---
 

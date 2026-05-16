@@ -68,6 +68,11 @@ const VENDOR_SIGNATURES = [
   { vendor: 'ga4',             category: 'analytics_pageview', phase: 'lazy', re: /gtag\(\s*['"]event['"]\s*,\s*['"]page_view['"]|google-analytics\.com\/g\/collect|G-[A-Z0-9]{6,}/ },
   { vendor: 'ga-universal',    category: 'analytics_pageview', phase: 'lazy', re: /\bga\(\s*['"]send['"]\s*,\s*['"]pageview['"]/i },
 
+  // Advertising — Google Ads conversion / remarketing pixels via gtag.js
+  // Detected separately from GA4 because a site may load Ads without GA (or vice versa);
+  // the `direct-gtag-lazy` strategy in the workflow keys off either being present.
+  { vendor: 'google-ads',      category: 'analytics_events',   phase: 'delayed', re: /AW-[0-9]{6,}|googleadservices\.com|googleads\.g\.doubleclick\.net|gtag\(\s*['"]event['"]\s*,\s*['"]conversion['"]/i },
+
   // Analytics — events (stay in delayed container)
   { vendor: 'mixpanel',      category: 'analytics_events', phase: 'delayed', re: /cdn\.mxpnl\.com|mixpanel\.(init|track)/i },
   { vendor: 'amplitude',     category: 'analytics_events', phase: 'delayed', re: /cdn\.amplitude\.com|amplitude\.getInstance/i },
