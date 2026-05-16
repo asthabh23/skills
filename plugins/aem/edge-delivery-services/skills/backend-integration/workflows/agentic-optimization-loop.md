@@ -378,6 +378,15 @@ No local delta math. The Phase 6 decision reads `result.overallImproved` and `re
 
 ## Phase 5: Verify Regressions
 
+This phase compares baseline network calls against the migrated preview. It serves **two purposes**, not one:
+
+1. **Detects unintentional regressions** — the loop's generated code, deploy step, or a tuning iteration broke something. A baseline call missing on the preview is a defect.
+2. **Detects misconfigured customer setups** — if `datastream_ids`, `orgId`, or `target_property_token` are unset, the generated `SKIP_MARTECH` guard short-circuits and martech calls don't fire on the preview. The corresponding baseline calls (`edge.adobedc.net/interact`, `*.tt.omtrdc.net/*`, Adobe Analytics beacons, etc.) appear as critical missing calls in the regression report.
+
+The output is honest in both cases. Phase 6 evaluates the regression list and routes to `REGRESSION` → diagnostic findings (Step 6.3) → human review. The reviewer sees "these specific calls didn't fire because their config wasn't supplied" rather than the loop pretending SUCCESS.
+
+> **Why this is the right behavior, not a workaround:** the loop can't invent customer identifiers (datastream IDs come from AEP admin consoles the loop can't authenticate to). Phase 5 turns "missing identifiers" into a *visible* regression, which makes the incomplete-config case actionable instead of silently degrading the migration.
+
 ### Step 5.1: Capture Post-Migration Network Calls
 
 ```javascript
@@ -1200,4 +1209,5 @@ This table is for **inherent trade-offs** that will remain true even when the sk
 |------|------------------|
 | **Data layer mapping complexity** — Highly customized data layers may not map to XDM automatically | `extractDataLayerSchema` in [`references/data-layer-mapping.md`](../references/data-layer-mapping.md) surfaces low-confidence fields as `manual_review_items`. Some customers will always need human mapping; this is not something the loop will eliminate. |
 | **Region-aware consent posture** — A US-only customer under CCPA wants opt-out by default; an EU customer under GDPR wants opt-in; a global customer wants `opt-in-eu-only` (branch on detected region). The loop can't infer the right model from the source site — it's a customer policy decision, not a technical signal. Real-world precedent: petplace.com skips its consent banner entirely for US visitors and grants all categories by default. | Driven by `adobe_stack.consent_model` config: `opt-in` (default; safe under GDPR), `opt-out` (CCPA-style), or `opt-in-eu-only` (geo-branched). The aem-martech template generates the matching `defaultConsent` value and the consent fanout handler reads the same flag to decide whether to grant by default. Document the choice in the customer's compliance record; the loop won't second-guess it. |
+| **Configuration completeness** — Customer-supplied identifiers (datastream IDs per environment, IMS Org ID, Target property token) come from Adobe admin consoles the loop can't authenticate to. Empty values trigger `SKIP_MARTECH=true` in the generated code, which means alloy and the analytics beacon don't fire on the preview at all. | Phase 5's network regression check is the safety net. Missing customer IDs surface as missing baseline calls in the regression report (`edge.adobedc.net/interact`, `*.tt.omtrdc.net/*`, etc.) — Phase 6 routes to REGRESSION and the diagnostic findings name exactly which IDs are unset. The loop will keep iterating with the same missing list every iteration; that repeating list **is** the signal to the reviewer that customer config is the gap. No silent SUCCESS on an unconfigured run. |
 
